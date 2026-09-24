@@ -33,6 +33,7 @@
 #include "ap_dhcp.h"
 #include "clients.h"
 #include "doh_relay.h"
+#include "portmap.h"
 #include "static_leases.h"
 #include "led_off.h"
 
@@ -326,6 +327,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         } else {
             ESP_LOGI(TAG_STA, "NAPT enabled on the AP interface");
         }
+        /* Re-push the forwarding rules: they store the external address as it
+         * was when they were created, so a new lease invalidates them. Must
+         * follow the NAPT enable, which is what allocates lwIP's portmap table. */
+        portmap_apply_all(e->ip_info.ip.addr);
         doh_relay_flush_cache(); /* the upstream network may have changed */
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
@@ -526,6 +531,18 @@ static const char *html_page =
 "    <button class='btn' onclick='addLease()'>ADD LEASE</button>"
 "    <div id='lease-msg' style='margin-top:10px;font-size:12px'></div>"
 "    <hr style='margin:24px 0;border-color:#e2e8f0'>"
+"    <h1 style='margin-bottom:6px'>Port forwarding</h1>"
+"    <div id='pm-note' style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Open one port on the upstream side and send it to a client behind this AP.</div>"
+"    <div id='pm-list'><div class='loading'>Loading...</div></div>"
+"    <div class='form-group'><label>Protocol</label>"
+"      <select id='pm-proto' style='width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px'>"
+"        <option value='tcp'>TCP</option><option value='udp'>UDP</option></select></div>"
+"    <div class='form-group'><label>External port (on the upstream side)</label><input type='text' id='pm-mport' placeholder='8080'></div>"
+"    <div class='form-group'><label>Target client IP</label><input type='text' id='pm-daddr' placeholder='192.168.4.150'></div>"
+"    <div class='form-group'><label>Target port</label><input type='text' id='pm-dport' placeholder='80'></div>"
+"    <button class='btn' onclick='addPortmap()'>ADD RULE</button>"
+"    <div id='pm-msg' style='margin-top:10px;font-size:12px'></div>"
+"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
 "    <button class='btn danger' onclick='resetAP()'>FACTORY RESET AP</button>"
 "    <div style='margin-top:8px;font-size:11px;color:#94a3b8'>Resets the AP password to a new random value</div>"
 "  </div>"
@@ -543,7 +560,7 @@ static const char *html_page =
 "  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));"
 "  event.target.classList.add('active');"
 "  document.getElementById('tab-'+tab).classList.add('active');"
-"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadLeases(); }"
+"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadLeases(); loadPortmaps(); }"
 "  if(tab==='clients'){ loadClients(); }"
 "}"
 "function bars(rssi){"
@@ -576,6 +593,44 @@ static const char *html_page =
 "    });"
 "    box.innerHTML = h + '</div>';"
 "  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function loadPortmaps(){"
+"  const box=document.getElementById('pm-list');"
+"  fetch('/api/portmaps').then(r=>r.json()).then(d=>{"
+"    document.getElementById('pm-note').innerHTML = d.external"
+"      ? 'Reachable from the upstream network at <b>'+d.external+'</b>. Not reachable from the internet unless the upstream router also forwards it here.'"
+"      : 'No upstream address yet.';"
+"    if(!d.rules.length){ box.innerHTML='<div class=\"loading\">No rules</div>'; return; }"
+"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.rules.forEach(r=>{"
+"      h += '<div class=\"network-item\" style=\"display:block\">'"
+"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
+"         + '<span style=\"font-family:monospace;font-size:13px\"><b>'+r.proto+' '+r.mport+'</b> &rarr; '+r.daddr+':'+r.dport+'</span>'"
+"         + '<button class=\"refresh-btn\" onclick=\"delPortmap(\\''+r.proto+'\\','+r.mport+')\">delete</button>'"
+"         + '</div></div>';"
+"    });"
+"    box.innerHTML = h + '</div>';"
+"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function addPortmap(){"
+"  const p=document.getElementById('pm-proto').value;"
+"  const mp=document.getElementById('pm-mport').value.trim();"
+"  const da=document.getElementById('pm-daddr').value.trim();"
+"  const dp=document.getElementById('pm-dport').value.trim();"
+"  const m=document.getElementById('pm-msg');"
+"  if(!mp||!da||!dp){ m.innerHTML='<span style=\"color:#b45309\">Fill in port, target IP and target port</span>'; return; }"
+"  fetch('/portmap/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+p+'&mport='+encodeURIComponent(mp)+'&daddr='+encodeURIComponent(da)+'&dport='+encodeURIComponent(dp)})"
+"  .then(r=>r.text().then(t=>{"
+"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Rule added and active.</span>'"
+"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
+"    if(r.ok){ document.getElementById('pm-mport').value=''; document.getElementById('pm-daddr').value=''; document.getElementById('pm-dport').value=''; }"
+"    loadPortmaps();"
+"  }));"
+"}"
+"function delPortmap(proto,mport){"
+"  if(!confirm('Remove '+proto+' '+mport+'?')) return;"
+"  fetch('/portmap/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+proto+'&mport='+mport})"
+"  .then(()=>loadPortmaps());"
 "}"
 "function loadLeases(){"
 "  const box=document.getElementById('lease-list');"
@@ -1067,6 +1122,145 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t portmaps_get_handler(httpd_req_t *req)
+{
+    portmap_entry_t list[PORTMAP_MAX];
+    int n = portmap_list(list, PORTMAP_MAX);
+
+    /* The external address is the station's, so show it: it is also what tells
+     * the user the mapping is only reachable from the upstream LAN. */
+    esp_netif_ip_info_t sta = {0};
+    esp_netif_get_ip_info(sta_netif, &sta);
+
+    cJSON *root = cJSON_CreateObject();
+    char buf[20];
+    snprintf(buf, sizeof(buf), IPSTR, IP2STR(&sta.ip));
+    cJSON_AddStringToObject(root, "external", buf);
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        esp_ip4_addr_t d = { .addr = list[i].daddr };
+        cJSON_AddStringToObject(o, "proto", list[i].proto == 6 ? "tcp" : "udp");
+        cJSON_AddNumberToObject(o, "mport", list[i].mport);
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&d));
+        cJSON_AddStringToObject(o, "daddr", buf);
+        cJSON_AddNumberToObject(o, "dport", list[i].dport);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "rules", arr);
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t add_portmap_post_handler(httpd_req_t *req)
+{
+    char buf[256] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_proto[16] = {0}, raw_mport[16] = {0}, raw_addr[64] = {0}, raw_dport[16] = {0};
+    if (httpd_query_key_value(buf, "proto", raw_proto, sizeof(raw_proto)) != ESP_OK ||
+            httpd_query_key_value(buf, "mport", raw_mport, sizeof(raw_mport)) != ESP_OK ||
+            httpd_query_key_value(buf, "daddr", raw_addr, sizeof(raw_addr)) != ESP_OK ||
+            httpd_query_key_value(buf, "dport", raw_dport, sizeof(raw_dport)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "proto, mport, daddr and dport required");
+        return ESP_FAIL;
+    }
+
+    char proto_s[16] = {0}, addr_s[64] = {0};
+    url_decode(proto_s, sizeof(proto_s), raw_proto);
+    url_decode(addr_s, sizeof(addr_s), raw_addr);
+
+    uint8_t proto;
+    if (strcasecmp(proto_s, "tcp") == 0) {
+        proto = 6;
+    } else if (strcasecmp(proto_s, "udp") == 0) {
+        proto = 17;
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "proto must be tcp or udp");
+        return ESP_FAIL;
+    }
+
+    long mp = strtol(raw_mport, NULL, 10);
+    long dp = strtol(raw_dport, NULL, 10);
+    if (mp < 1 || mp > 65535 || dp < 1 || dp > 65535) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ports must be 1-65535");
+        return ESP_FAIL;
+    }
+
+    esp_ip4_addr_t daddr;
+    if (esp_netif_str_to_ip4(addr_s, &daddr) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad target IPv4 address");
+        return ESP_FAIL;
+    }
+
+    esp_netif_ip_info_t ap = {0};
+    if (esp_netif_get_ip_info(ap_netif, &ap) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = portmap_add(proto, (uint16_t)mp, daddr.addr, (uint16_t)dp,
+                                ap.ip.addr, ap.netmask.addr);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "rejected: target must be a client on the AP subnet");
+        return ESP_FAIL;
+    }
+
+    /* Push it live with the current station address. */
+    esp_netif_ip_info_t sta = {0};
+    if (esp_netif_get_ip_info(sta_netif, &sta) == ESP_OK && sta.ip.addr != 0) {
+        portmap_apply_all(sta.ip.addr);
+    }
+
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t del_portmap_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_proto[16] = {0}, raw_mport[16] = {0};
+    if (httpd_query_key_value(buf, "proto", raw_proto, sizeof(raw_proto)) != ESP_OK ||
+            httpd_query_key_value(buf, "mport", raw_mport, sizeof(raw_mport)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "proto and mport required");
+        return ESP_FAIL;
+    }
+    char proto_s[16] = {0};
+    url_decode(proto_s, sizeof(proto_s), raw_proto);
+    uint8_t proto = (strcasecmp(proto_s, "udp") == 0) ? 17 : 6;
+    long mp = strtol(raw_mport, NULL, 10);
+    if (mp < 1 || mp > 65535) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad port");
+        return ESP_FAIL;
+    }
+    if (portmap_remove(proto, (uint16_t)mp) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such rule");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t radio_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -1326,7 +1520,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 28;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -1352,6 +1546,9 @@ static void start_http_server(void)
         { .uri = "/api/leases",  .method = HTTP_GET,  .handler = leases_get_handler },
         { .uri = "/lease/add",   .method = HTTP_POST, .handler = add_lease_post_handler },
         { .uri = "/lease/del",   .method = HTTP_POST, .handler = del_lease_post_handler },
+        { .uri = "/api/portmaps", .method = HTTP_GET,  .handler = portmaps_get_handler },
+        { .uri = "/portmap/add",  .method = HTTP_POST, .handler = add_portmap_post_handler },
+        { .uri = "/portmap/del",  .method = HTTP_POST, .handler = del_portmap_post_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
@@ -1409,6 +1606,7 @@ void app_main(void)
 
     clients_init();
     static_leases_init();
+    portmap_init();
 
     s_wifi_eg = xEventGroupCreate();
     if (s_wifi_eg == NULL) {
