@@ -8,6 +8,19 @@ vendored_dhcps.c differs from upstream/dhcpserver.c only by:
   - renamed headers (guards __DHCPS_H__ -> __VENDORED_DHCPS_H__)
   - local fallbacks for MAX_STATION_NUM / LEASE_UNIT, which the IDF Kconfig
     removes when CONFIG_LWIP_DHCPS=n
-  - static-lease support (see LEASES in the source)
+  - `#if ESP_DHCPS` at the top of the file body replaced by VENDORED_DHCPS.
+    ESP_DHCPS follows CONFIG_LWIP_DHCPS, so leaving it would compile this whole
+    file to nothing with the IDF server disabled.
+  - `#if CONFIG_LWIP_DHCPS` in dhcpserver.h likewise (it gates the per-client
+    hostname storage)
+  - static leases: a call to static_leases_lookup() in parse_msg(), inserted
+    after POOL_CHECK and before parse_options() so that yiaddr (built by
+    create_msg from dhcps->client_address) and the option-50 comparison both
+    use the leased address, and the pool entry records it. Search for
+    "local addition: static leases".
 
 Run:  diff -u upstream/dhcpserver.c vendored_dhcps.c
+
+The three files were copied on 2026-09-24 and have not been reconciled against
+any later IDF release. When upgrading IDF, diff upstream/ against the new
+components/lwip/apps/dhcpserver/ to see what was missed.

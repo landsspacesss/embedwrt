@@ -33,6 +33,7 @@
 #include "ap_dhcp.h"
 #include "clients.h"
 #include "doh_relay.h"
+#include "static_leases.h"
 #include "led_off.h"
 
 #define AP_SSID_PREFIX    "ESPWIFI"
@@ -517,6 +518,14 @@ static const char *html_page =
 "    <div id='doh-state' style='margin-top:10px;font-size:12px;color:#64748b'></div>"
 "    <div id='doh-suggest' style='margin-top:8px;font-size:11px;color:#94a3b8'></div>"
 "    <hr style='margin:24px 0;border-color:#e2e8f0'>"
+"    <h1 style='margin-bottom:6px'>Static leases</h1>"
+"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Bind a MAC to a fixed address. Must be outside the dynamic pool, or the allocator could hand the same address to someone else.</div>"
+"    <div id='lease-list'><div class='loading'>Loading...</div></div>"
+"    <div class='form-group'><label>MAC</label><input type='text' id='lease-mac' placeholder='aa:bb:cc:dd:ee:ff'></div>"
+"    <div class='form-group'><label>IP</label><input type='text' id='lease-ip' placeholder='192.168.4.150'></div>"
+"    <button class='btn' onclick='addLease()'>ADD LEASE</button>"
+"    <div id='lease-msg' style='margin-top:10px;font-size:12px'></div>"
+"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
 "    <button class='btn danger' onclick='resetAP()'>FACTORY RESET AP</button>"
 "    <div style='margin-top:8px;font-size:11px;color:#94a3b8'>Resets the AP password to a new random value</div>"
 "  </div>"
@@ -534,7 +543,7 @@ static const char *html_page =
 "  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));"
 "  event.target.classList.add('active');"
 "  document.getElementById('tab-'+tab).classList.add('active');"
-"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); }"
+"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadLeases(); }"
 "  if(tab==='clients'){ loadClients(); }"
 "}"
 "function bars(rssi){"
@@ -567,6 +576,41 @@ static const char *html_page =
 "    });"
 "    box.innerHTML = h + '</div>';"
 "  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function loadLeases(){"
+"  const box=document.getElementById('lease-list');"
+"  fetch('/api/leases').then(r=>r.json()).then(d=>{"
+"    const pool = d.pool_known ? ('Free range: <b>'+d.pool_first+' - '+d.pool_last+'</b> is in use by the pool; pick something outside it, e.g. 192.168.4.150') : 'Pool bounds unknown; adding leases is disabled.';"
+"    if(!d.leases.length){ box.innerHTML='<div class=\"loading\">No static leases</div>'; document.getElementById('lease-msg').innerHTML=pool; return; }"
+"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.leases.forEach(l=>{"
+"      h += '<div class=\"network-item\" style=\"display:block\">'"
+"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
+"         + '<span style=\"font-family:monospace;font-size:13px\"><b>'+l.ip+'</b> &rarr; '+l.mac+'</span>'"
+"         + '<button class=\"refresh-btn\" onclick=\"delLease(\\''+l.mac+'\\')\">delete</button>'"
+"         + '</div></div>';"
+"    });"
+"    box.innerHTML = h + '</div>';"
+"    document.getElementById('lease-msg').innerHTML=pool;"
+"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function addLease(){"
+"  const mac=document.getElementById('lease-mac').value.trim();"
+"  const ip=document.getElementById('lease-ip').value.trim();"
+"  const m=document.getElementById('lease-msg');"
+"  if(!mac||!ip) { m.innerHTML='<span style=\"color:#b45309\">Enter both MAC and IP</span>'; return; }"
+"  fetch('/lease/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&ip='+encodeURIComponent(ip)})"
+"  .then(r=>r.text().then(t=>{"
+"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Lease added. The client picks it up on its next request.</span>'"
+"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
+"    if(r.ok){ document.getElementById('lease-mac').value=''; document.getElementById('lease-ip').value=''; }"
+"    loadLeases();"
+"  }));"
+"}"
+"function delLease(mac){"
+"  if(!confirm('Remove the lease for '+mac+'?')) return;"
+"  fetch('/lease/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
+"  .then(()=>loadLeases());"
 "}"
 "function loadRadio(){"
 "  fetch('/api/radio').then(r=>r.json()).then(d=>{"
@@ -874,6 +918,155 @@ static esp_err_t connect_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Parse "aa:bb:cc:dd:ee:ff" (also accepting '-' separators). */
+static bool parse_mac(const char *s, uint8_t out[6])
+{
+    unsigned v[6];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6 &&
+            sscanf(s, "%x-%x-%x-%x-%x-%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (v[i] > 0xFF) {
+            return false;
+        }
+        out[i] = (uint8_t)v[i];
+    }
+    return true;
+}
+
+static esp_err_t leases_get_handler(httpd_req_t *req)
+{
+    static_lease_t list[STATIC_LEASE_MAX];
+    int n = static_leases_list(list, STATIC_LEASE_MAX);
+
+    uint32_t pf = 0, pl = 0;
+    bool have_pool = (ap_dhcp_pool_bounds(&pf, &pl) == ESP_OK);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "impl", ap_dhcp_impl());
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        char mac[18], ip[16];
+        snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
+        esp_ip4_addr_t a = { .addr = list[i].ip };
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&a));
+        cJSON_AddStringToObject(o, "mac", mac);
+        cJSON_AddStringToObject(o, "ip", ip);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "leases", arr);
+    cJSON_AddBoolToObject(root, "pool_known", have_pool);
+    if (have_pool) {
+        /* Shown so the user can see which addresses are eligible: anything the
+         * allocator can also hand out is rejected. */
+        char f[16], l[16];
+        esp_ip4_addr_t fa = { .addr = pf }, la = { .addr = pl };
+        snprintf(f, sizeof(f), IPSTR, IP2STR(&fa));
+        snprintf(l, sizeof(l), IPSTR, IP2STR(&la));
+        cJSON_AddStringToObject(root, "pool_first", f);
+        cJSON_AddStringToObject(root, "pool_last", l);
+    }
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t add_lease_post_handler(httpd_req_t *req)
+{
+    char buf[192] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_mac[64] = {0}, raw_ip[64] = {0};
+    if (httpd_query_key_value(buf, "mac", raw_mac, sizeof(raw_mac)) != ESP_OK ||
+            httpd_query_key_value(buf, "ip", raw_ip, sizeof(raw_ip)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac and ip required");
+        return ESP_FAIL;
+    }
+
+    char mac_s[32] = {0}, ip_s[32] = {0};
+    url_decode(mac_s, sizeof(mac_s), raw_mac);
+    url_decode(ip_s, sizeof(ip_s), raw_ip);
+
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC (use aa:bb:cc:dd:ee:ff)");
+        return ESP_FAIL;
+    }
+    esp_ip4_addr_t ip;
+    if (esp_netif_str_to_ip4(ip_s, &ip) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad IPv4 address");
+        return ESP_FAIL;
+    }
+
+    esp_netif_ip_info_t ap;
+    if (esp_netif_get_ip_info(ap_netif, &ap) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    /* Without pool bounds the overlap check cannot be made; refuse rather than
+     * risk an address the allocator could also hand out. */
+    uint32_t pf = 0, pl = 0;
+    if (ap_dhcp_pool_bounds(&pf, &pl) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "pool bounds unknown; cannot validate safely");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = static_leases_add(mac, ip.addr, ap.ip.addr, ap.netmask.addr, pf, pl);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "rejected: outside subnet, or inside the dynamic pool");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t del_lease_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_mac[64] = {0};
+    if (httpd_query_key_value(buf, "mac", raw_mac, sizeof(raw_mac)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    char mac_s[32] = {0};
+    url_decode(mac_s, sizeof(mac_s), raw_mac);
+
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    if (static_leases_remove(mac) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such lease");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t radio_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -1133,7 +1326,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 24;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -1156,6 +1349,9 @@ static void start_http_server(void)
         { .uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler },
         { .uri = "/api/radio",   .method = HTTP_GET,  .handler = radio_get_handler },
         { .uri = "/setradio",    .method = HTTP_POST, .handler = set_radio_post_handler },
+        { .uri = "/api/leases",  .method = HTTP_GET,  .handler = leases_get_handler },
+        { .uri = "/lease/add",   .method = HTTP_POST, .handler = add_lease_post_handler },
+        { .uri = "/lease/del",   .method = HTTP_POST, .handler = del_lease_post_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
@@ -1212,6 +1408,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     clients_init();
+    static_leases_init();
 
     s_wifi_eg = xEventGroupCreate();
     if (s_wifi_eg == NULL) {

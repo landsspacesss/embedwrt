@@ -49,3 +49,9 @@ esp_err_t ap_dhcp_start(esp_netif_t *ap_netif);
 
 /* Which implementation is compiled in: "own" or "idf". For /status. */
 const char *ap_dhcp_impl(void);
+
+/* Bounds of the dynamic address pool, in network byte order, for validating a
+ * static lease (an address inside the pool could also be handed out to somebody
+ * else). ESP_ERR_NOT_SUPPORTED when the running server cannot report them, in
+ * which case the caller should skip that check rather than guess. */
+esp_err_t ap_dhcp_pool_bounds(uint32_t *first, uint32_t *last);

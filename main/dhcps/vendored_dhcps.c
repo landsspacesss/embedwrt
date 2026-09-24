@@ -20,6 +20,9 @@
 #include "vendored_dhcps.h"
 #include "vendored_dhcps_options.h"
 
+/* Local addition (see dhcps/README): the one hook IDF does not offer. */
+#include "static_leases.h"
+
 /* Upstream this is `#if ESP_DHCPS`, which follows CONFIG_LWIP_DHCPS. That is
  * off in our build (it is what makes this copy the only DHCP server), so using
  * it here would compile the entire file away. */
@@ -1277,6 +1280,32 @@ POOL_CHECK:
 
             return 4;
         }
+
+        /*
+         * --- local addition: static leases -------------------------------
+         * Applied here, after the pool bookkeeping and its range check but
+         * before parse_options(). That placement is deliberate:
+         *   - create_msg() builds yiaddr from dhcps->client_address, so the
+         *     client is offered the address we just wrote;
+         *   - parse_options() snapshots the same field before comparing it to
+         *     option 50, so a client that requests its static address during
+         *     INIT-REBOOT gets an ACK instead of the NAK it would otherwise
+         *     receive for asking for something outside the pool;
+         *   - the pool entry keeps the real address, so dhcps_get_hostname_on_mac()
+         *     and the by-MAC reuse path stay consistent.
+         * Outside the pool is exactly why this cannot be an address the
+         * allocator might also hand out (see static_leases.h).
+         */
+        {
+            uint32_t lease_ip = 0;
+            if (static_leases_lookup(m->chaddr, &lease_ip)) {
+                dhcps->client_address.addr = lease_ip;
+                if (pdhcps_pool != NULL) {
+                    pdhcps_pool->ip.addr = lease_ip;
+                }
+            }
+        }
+        /* --- end local addition ---------------------------------------- */
 
         s16_t ret = parse_options(dhcps, &m->options[4], len);
 

@@ -25,6 +25,7 @@ ESP_EVENT_DEFINE_BASE(AP_DHCP_EVENT);
 #include "dhcps/vendored_dhcps_options.h"   /* SUBNET_MASK, DOMAIN_NAME_SERVER, ... */
 
 static dhcps_t *s_dhcps;
+static uint32_t s_pool_first, s_pool_last;   /* network byte order */
 
 /*
  * Fires after an ACK has been transmitted, i.e. from the UDP send path, so this
@@ -57,6 +58,16 @@ static void on_new_lease(void *arg, uint8_t client_ip[4], uint8_t client_mac[6])
 const char *ap_dhcp_impl(void)
 {
     return "own";
+}
+
+esp_err_t ap_dhcp_pool_bounds(uint32_t *first, uint32_t *last)
+{
+    if (first == NULL || last == NULL || s_pool_first == 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    *first = s_pool_first;
+    *last = s_pool_last;
+    return ESP_OK;
 }
 
 esp_err_t ap_dhcp_start(esp_netif_t *ap_netif)
@@ -148,6 +159,10 @@ esp_err_t ap_dhcp_start(esp_netif_t *ap_netif)
             ip4addr_ntoa_r(&rb_pool->start_ip, b_start, sizeof(b_start));
             ip4addr_ntoa_r(&rb_pool->end_ip, b_end, sizeof(b_end));
             ESP_LOGI(TAG, "pool %s - %s", b_start, b_end);
+            /* Remembered so static leases can refuse an address the allocator
+             * might also hand out. */
+            s_pool_first = rb_pool->start_ip.addr;
+            s_pool_last = rb_pool->end_ip.addr;
         } else {
             /* dhcps_poll_set() rejects a range that falls outside the server's
              * subnet, contains the server's own address, or spans more than
@@ -187,6 +202,16 @@ esp_err_t ap_dhcp_start(esp_netif_t *ap_netif)
 const char *ap_dhcp_impl(void)
 {
     return "idf";
+}
+
+esp_err_t ap_dhcp_pool_bounds(uint32_t *first, uint32_t *last)
+{
+    /* IDF's server does not expose the computed pool, and static leases are not
+     * functional in this configuration anyway (the vendored server is the one
+     * that consults them), so decline rather than report a guess. */
+    (void)first;
+    (void)last;
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t ap_dhcp_start(esp_netif_t *ap_netif)
