@@ -1,0 +1,51 @@
+menu "DHCP server"
+
+    config USE_OWN_DHCPS
+        bool "Use the vendored DHCP server instead of ESP-IDF's"
+        default y
+        help
+            Runs main/dhcps/vendored_dhcps.c, a copy of ESP-IDF's DHCP server,
+            so it can be extended (static leases). The vendored copy and IDF's
+            define the same dhcps_* symbols, so they cannot both be compiled:
+            enabling this REQUIRES "Component config -> LWIP -> DHCPS" to be
+            disabled. With CONFIG_LWIP_DHCPS=y the build fails at link time with
+            duplicate dhcps_new/dhcps_start definitions.
+
+            Turning this off is the rollback path: it restores IDF's server and
+            the esp_netif-based integration, with no other code changes.
+
+            Note the IDF Kconfig settings under DHCPS (max stations, lease unit,
+            hostname reporting) disappear when that option is off; the vendored
+            copy carries matching defaults in dhcps/vendored_dhcps_config.h.
+
+endmenu
+
+menu "Onboard RGB LED"
+
+    config LED_RGB_TEST_COLORS
+        bool "Diagnostic: drive R/G/B on the listed GPIOs to find the LED pin"
+        default n
+        help
+            Instead of sending black, send red to the first GPIO in the list,
+            green to the second and blue to the third. Whichever colour appears
+            identifies the pin that actually carries the LED. Turn this off and
+            narrow LED_RGB_GPIO_LIST to that one pin afterwards.
+
+    config LED_RGB_GPIO_LIST
+        string "WS2812 data GPIOs to drive black at boot (comma-separated)"
+        default "48,38,47"
+        help
+            A WS2812 latches its last colour, so a freshly flashed image leaves
+            the onboard RGB LED showing whatever the previous firmware wrote
+            there. This firmware never drives the LED, so it does not clear on
+            its own. Each GPIO listed here is sent a single black pixel once at
+            boot, which switches off whichever of them carries the LED.
+
+            Which pin carries the LED varies between board revisions of the
+            ESP32-S3 N16R8 family, hence the list. Set to "" to leave the LED
+            under whatever the previous firmware left it at, or to a single
+            GPIO once you know which one works.
+
+            Do not list GPIO 33-37: those carry the octal PSRAM.
+
+endmenu

@@ -1,0 +1,13 @@
+# Vendored ESP-IDF DHCP server
+
+Source: components/lwip/apps/dhcpserver/dhcpserver.c
+IDF version: 6.1.0
+dhcpserver.c sha1: 4eba197c7fb2d76b
+
+vendored_dhcps.c differs from upstream/dhcpserver.c only by:
+  - renamed headers (guards __DHCPS_H__ -> __VENDORED_DHCPS_H__)
+  - local fallbacks for MAX_STATION_NUM / LEASE_UNIT, which the IDF Kconfig
+    removes when CONFIG_LWIP_DHCPS=n
+  - static-lease support (see LEASES in the source)
+
+Run:  diff -u upstream/dhcpserver.c vendored_dhcps.c

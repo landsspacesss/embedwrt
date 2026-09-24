@@ -1,0 +1,16 @@
+# ESP-IDF build output
+build/
+build_*/
+sdkconfig
+sdkconfig.old
+
+# Component manager artifacts (fetched, not authored)
+managed_components/
+dependencies.lock
+
+# Editor / tooling noise
+.cache/
+.vscode/
+.idea/
+*.swp
+*~

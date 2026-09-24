@@ -1,0 +1,56 @@
+# --- NAT routing: required for the AP<->STA forwarder ---
+# Without these two the build fails: ip_napt_enable/esp_netif_napt_enable is a no-op.
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+
+# --- Board: ESP32-S3 N16R8 (16 MB flash) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- 4 MB app partition (see partitions.csv) ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- DHCP: run the vendored copy (main/dhcps) so static leases become possible.
+# --- The vendored copy and IDF's server define the same symbols, so IDF's must
+# --- be off; flipping these two back is the rollback. ---
+CONFIG_LWIP_DHCPS=n
+CONFIG_USE_OWN_DHCPS=y
+
+# --- mbedTLS: wall clock + root CA bundle, both needed by DNS-over-HTTPS ---
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# --- SNTP: 2 slots so a dead NTP host does not block time sync ---
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+
+# --- Default is 6, so a page load's worth of simultaneous lookups overflows the
+# --- socket and lwIP silently drops the excess before the relay ever sees it. ---
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+
+# --- Keep the TLS session to the DoH resolver alive between queries ---
+CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS=y
+
+# --- TLS handshake cost on this chip is CPU-bound; 240 MHz is free headroom ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- ESP-IDF ships -Og (debug-friendly). A full TLS handshake here is software
+# --- big-integer ECC, which -O2 speeds up materially. ---
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Block-ACK windows. Kconfig documents 16 as the value needed for good
+# --- throughput ("the default and minimum value should be 16"); it stays at 6
+# --- unless WiFi/LWIP buffers are moved to PSRAM. We set it outright rather
+# --- than relocating those buffers, which would add PSRAM latency to the
+# --- forwarding path. ---
+CONFIG_ESP_WIFI_RX_BA_WIN=16
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+
+# --- Board has 8 MB octal PSRAM. Several concurrent TLS sessions to the DoH
+# --- resolver are what keeps lookups parallel, and they do not fit in internal
+# --- RAM alone. ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Send allocations over 4 KB to PSRAM, so TLS record buffers land there too.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
