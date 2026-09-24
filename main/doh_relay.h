@@ -65,9 +65,26 @@ typedef struct {
     uint32_t cached;
     uint32_t new_conns;   /* full TLS handshakes performed */
     uint32_t pooled;      /* queries served over a reused connection */
-    uint32_t fallback;    /* answered in plaintext */
+    uint32_t fallback;    /* answered in plaintext after a resolver failed */
     uint32_t servfail;
     uint32_t drops;       /* requests our own queue could not accept */
+    uint32_t dot;         /* answered over DoT (a per-device rule) */
+    uint32_t plain_rule;  /* answered by a per-device plaintext rule */
 } doh_stats_t;
 
 void doh_relay_get_stats(doh_stats_t *out);
+
+/*
+ * Diagnostic: run one real query through the given resolver, bypassing both the
+ * cache and the relay's queue.
+ *
+ * This exists because the per-device rule matching can only be exercised by a
+ * client that is actually on the AP, which is not always available. Sending a
+ * query through the same resolver code the relay uses verifies the parts that
+ * would otherwise be untestable: DoT framing and TLS setup, the DoH path, and
+ * the plaintext path, each against a real server.
+ *
+ * `out` receives a short human-readable result. Blocks for the query's duration.
+ */
+esp_err_t doh_relay_probe(uint8_t mode, const char *addr, const char *name,
+                          char *out, size_t out_cap);

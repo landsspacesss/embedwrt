@@ -32,6 +32,7 @@
 
 #include "ap_dhcp.h"
 #include "clients.h"
+#include "dns_rules.h"
 #include "doh_relay.h"
 #include "portmap.h"
 #include "static_leases.h"
@@ -349,6 +350,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                  IP2STR(&e->ip), MAC2STR(e->mac),
                  e->hostname[0] ? " host=" : "", e->hostname);
         clients_note_ip(e->mac, e->ip, e->hostname);
+        /* Keeps the DNS relay's IP->rule map current: it only ever sees a
+         * query's source address, not the MAC. */
+        dns_rules_note_ip(e->mac, e->ip.addr);
     }
 }
 
@@ -523,6 +527,21 @@ static const char *html_page =
 "    <div id='doh-state' style='margin-top:10px;font-size:12px;color:#64748b'></div>"
 "    <div id='doh-suggest' style='margin-top:8px;font-size:11px;color:#94a3b8'></div>"
 "    <hr style='margin:24px 0;border-color:#e2e8f0'>"
+"    <h1 style='margin-bottom:6px'>Per-device DNS</h1>"
+"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Point one device at its own resolver, by MAC. Devices with no rule use the resolver above. DoH wants an <code>https://</code> URL; DoT and plain DNS want an IPv4 literal, <code>IP</code> or <code>IP:port</code>.</div>"
+"    <div id='dr-list'><div class='loading'>Loading...</div></div>"
+"    <div class='form-group'><label>Device MAC</label><input type='text' id='dr-mac' placeholder='aa:bb:cc:dd:ee:ff'></div>"
+"    <div class='form-group'><label>Protocol</label>"
+"      <select id='dr-mode' style='width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px'>"
+"        <option value='doh'>DoH (https:// URL)</option>"
+"        <option value='dot'>DoT (IP, default port 853)</option>"
+"        <option value='dns'>Plain DNS (IP, default port 53)</option>"
+"      </select></div>"
+"    <div class='form-group'><label>Resolver address</label><input type='text' id='dr-addr' placeholder='https://1.12.12.12/dns-query  or  223.5.5.5'></div>"
+"    <button class='btn' onclick='addDnsRule()'>SAVE RULE</button>"
+"    <button class='btn' style='background:#0f766e;margin-top:8px' onclick='runDnsTest()'>TEST ALL RESOLVERS</button>"
+"    <div id='dr-msg' style='margin-top:10px;font-size:12px'></div>"
+"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
 "    <h1 style='margin-bottom:6px'>Static leases</h1>"
 "    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Bind a MAC to a fixed address. Must be outside the dynamic pool, or the allocator could hand the same address to someone else.</div>"
 "    <div id='lease-list'><div class='loading'>Loading...</div></div>"
@@ -560,7 +579,7 @@ static const char *html_page =
 "  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));"
 "  event.target.classList.add('active');"
 "  document.getElementById('tab-'+tab).classList.add('active');"
-"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadLeases(); loadPortmaps(); }"
+"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadDnsRules(); loadLeases(); loadPortmaps(); }"
 "  if(tab==='clients'){ loadClients(); }"
 "}"
 "function bars(rssi){"
@@ -593,6 +612,50 @@ static const char *html_page =
 "    });"
 "    box.innerHTML = h + '</div>';"
 "  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function loadDnsRules(){"
+"  const box=document.getElementById('dr-list');"
+"  fetch('/api/dnsrules').then(r=>r.json()).then(d=>{"
+"    if(!d.rules.length){ box.innerHTML='<div class=\"loading\">No per-device rules</div>'; return; }"
+"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.rules.forEach(r=>{"
+"      h += '<div class=\"network-item\" style=\"display:block\">'"
+"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
+"         + '<span style=\"font-family:monospace;font-size:12px\"><b>'+r.mode+'</b> '+r.addr+'<br><span style=\"color:#64748b\">'+r.mac+'</span></span>'"
+"         + '<button class=\"refresh-btn\" onclick=\"delDnsRule(\\''+r.mac+'\\')\">delete</button>'"
+"         + '</div></div>';"
+"    });"
+"    box.innerHTML = h + '</div>';"
+"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
+"}"
+"function addDnsRule(){"
+"  const mac=document.getElementById('dr-mac').value.trim();"
+"  const mode=document.getElementById('dr-mode').value;"
+"  const addr=document.getElementById('dr-addr').value.trim();"
+"  const m=document.getElementById('dr-msg');"
+"  if(!mac||!addr){ m.innerHTML='<span style=\"color:#b45309\">Enter both MAC and address</span>'; return; }"
+"  fetch('/dnsrule/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&mode='+mode+'&addr='+encodeURIComponent(addr)})"
+"  .then(r=>r.text().then(t=>{"
+"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Rule saved.</span>'"
+"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
+"    if(r.ok){ document.getElementById('dr-mac').value=''; document.getElementById('dr-addr').value=''; }"
+"    loadDnsRules();"
+"  }));"
+"}"
+"function delDnsRule(mac){"
+"  if(!confirm('Remove the DNS rule for '+mac+'?')) return;"
+"  fetch('/dnsrule/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
+"  .then(()=>loadDnsRules());"
+"}"
+"function runDnsTest(){"
+"  const m=document.getElementById('dr-msg');"
+"  m.innerHTML='<span style=\"color:#64748b\">Testing each resolver with a real query, this can take ~10s per DoT/DoH entry...</span>';"
+"  fetch('/api/dnstest').then(r=>r.json()).then(d=>{"
+"    let h='<div style=\"font-family:monospace;font-size:11px;line-height:1.6\">';"
+"    h += '<b>default</b> (doh) '+d.default.addr+'<br>&nbsp;&nbsp;'+d.default.result+'<br>';"
+"    d.rules.forEach(r=>{ h += '<b>'+r.mac+'</b> ('+r.mode+') '+r.addr+'<br>&nbsp;&nbsp;'+r.result+'<br>'; });"
+"    m.innerHTML = h + '</div>';"
+"  }).catch(e=>m.innerHTML='<span style=\"color:#b91c1c\">Test request failed</span>');"
 "}"
 "function loadPortmaps(){"
 "  const box=document.getElementById('pm-list');"
@@ -853,6 +916,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "q_fallback", st.fallback);
     cJSON_AddNumberToObject(root, "q_servfail", st.servfail);
     cJSON_AddNumberToObject(root, "q_drops", st.drops);
+    cJSON_AddNumberToObject(root, "q_dot", st.dot);
+    cJSON_AddNumberToObject(root, "q_plain_rule", st.plain_rule);
 
     const char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
@@ -1119,6 +1184,177 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static const char *mode_name(uint8_t mode)
+{
+    return (mode == DNS_MODE_DOT) ? "dot" : (mode == DNS_MODE_PLAIN ? "dns" : "doh");
+}
+
+static esp_err_t dnsrules_get_handler(httpd_req_t *req)
+{
+    dns_rule_t list[DNS_RULE_MAX];
+    int n = dns_rules_list(list, DNS_RULE_MAX);
+
+    cJSON *root = cJSON_CreateObject();
+    char def[DOH_URL_MAX];
+    doh_relay_get_url(def, sizeof(def));
+    cJSON_AddStringToObject(root, "default_url", def);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        char mac[18];
+        snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
+        cJSON_AddStringToObject(o, "mac", mac);
+        cJSON_AddStringToObject(o, "mode", mode_name(list[i].mode));
+        cJSON_AddStringToObject(o, "addr", list[i].addr);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "rules", arr);
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_dnsrule_post_handler(httpd_req_t *req)
+{
+    char buf[384] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_mac[64] = {0}, raw_mode[16] = {0}, raw_addr[192] = {0};
+    if (httpd_query_key_value(buf, "mac", raw_mac, sizeof(raw_mac)) != ESP_OK ||
+            httpd_query_key_value(buf, "mode", raw_mode, sizeof(raw_mode)) != ESP_OK ||
+            httpd_query_key_value(buf, "addr", raw_addr, sizeof(raw_addr)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac, mode and addr required");
+        return ESP_FAIL;
+    }
+
+    char mac_s[32] = {0}, mode_s[16] = {0}, addr_s[DNS_RULE_ADDR_MAX] = {0};
+    url_decode(mac_s, sizeof(mac_s), raw_mac);
+    url_decode(mode_s, sizeof(mode_s), raw_mode);
+    url_decode(addr_s, sizeof(addr_s), raw_addr);
+
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC (use aa:bb:cc:dd:ee:ff)");
+        return ESP_FAIL;
+    }
+    uint8_t mode;
+    if (strcasecmp(mode_s, "doh") == 0) {
+        mode = DNS_MODE_DOH;
+    } else if (strcasecmp(mode_s, "dot") == 0) {
+        mode = DNS_MODE_DOT;
+    } else if (strcasecmp(mode_s, "dns") == 0) {
+        mode = DNS_MODE_PLAIN;
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be doh, dot or dns");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = dns_rules_set(mac, mode, addr_s);
+    if (err == ESP_ERR_INVALID_ARG) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "bad address: DoH needs an https:// URL; DoT/DNS need an IPv4 literal (IP or IP:port)");
+        return ESP_FAIL;
+    }
+    if (err == ESP_ERR_NO_MEM) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "too many rules");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t del_dnsrule_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_mac[64] = {0};
+    if (httpd_query_key_value(buf, "mac", raw_mac, sizeof(raw_mac)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    char mac_s[32] = {0};
+    url_decode(mac_s, sizeof(mac_s), raw_mac);
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    if (dns_rules_remove(mac) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such rule");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/*
+ * Run a real query through each configured resolver and report the outcome.
+ *
+ * This is the only way to exercise DoT and the DoH/plain paths for a per-device
+ * rule without a client on the AP: it uses the same resolver code the relay
+ * serves clients with, against real servers, so a broken framing or TLS setup
+ * shows up here instead of silently degrading every lookup.
+ */
+static esp_err_t dnstest_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+
+    char def[DOH_URL_MAX];
+    doh_relay_get_url(def, sizeof(def));
+    char result[128];
+    doh_relay_probe(DNS_MODE_DOH, def, "example.com", result, sizeof(result));
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "addr", def);
+    cJSON_AddStringToObject(d, "mode", "doh");
+    cJSON_AddStringToObject(d, "result", result);
+    cJSON_AddItemToObject(root, "default", d);
+
+    dns_rule_t list[DNS_RULE_MAX];
+    int n = dns_rules_list(list, DNS_RULE_MAX);
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        char mac[18];
+        snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
+        doh_relay_probe(list[i].mode, list[i].addr, "example.com", result, sizeof(result));
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "mac", mac);
+        cJSON_AddStringToObject(o, "mode", mode_name(list[i].mode));
+        cJSON_AddStringToObject(o, "addr", list[i].addr);
+        cJSON_AddStringToObject(o, "result", result);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "rules", arr);
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
     return ESP_OK;
 }
 
@@ -1520,7 +1756,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 28;
+    cfg.max_uri_handlers = 32;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -1546,6 +1782,10 @@ static void start_http_server(void)
         { .uri = "/api/leases",  .method = HTTP_GET,  .handler = leases_get_handler },
         { .uri = "/lease/add",   .method = HTTP_POST, .handler = add_lease_post_handler },
         { .uri = "/lease/del",   .method = HTTP_POST, .handler = del_lease_post_handler },
+        { .uri = "/api/dnsrules", .method = HTTP_GET,  .handler = dnsrules_get_handler },
+        { .uri = "/dnsrule/set",  .method = HTTP_POST, .handler = set_dnsrule_post_handler },
+        { .uri = "/dnsrule/del",  .method = HTTP_POST, .handler = del_dnsrule_post_handler },
+        { .uri = "/api/dnstest",  .method = HTTP_GET,  .handler = dnstest_get_handler },
         { .uri = "/api/portmaps", .method = HTTP_GET,  .handler = portmaps_get_handler },
         { .uri = "/portmap/add",  .method = HTTP_POST, .handler = add_portmap_post_handler },
         { .uri = "/portmap/del",  .method = HTTP_POST, .handler = del_portmap_post_handler },
@@ -1607,6 +1847,7 @@ void app_main(void)
     clients_init();
     static_leases_init();
     portmap_init();
+    dns_rules_init();
 
     s_wifi_eg = xEventGroupCreate();
     if (s_wifi_eg == NULL) {
