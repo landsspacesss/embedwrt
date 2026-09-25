@@ -134,11 +134,19 @@ buffer that goes out of scope before `httpd_resp_send()` makes the header be
 written from reused stack — a `Set-Cookie` of binary garbage, identical on every
 request. String literals are safe; a local buffer must be alive across the send.
 
-**`max_open_sockets` defaults to 7, and `lru_purge_enable` is off on purpose.**
-Page loads run their requests sequentially, so the socket count stays at one
-however many panel sections exist. Adding a section means adding it to that
-chain. If the limit is ever hit it should fail visibly rather than silently
-resetting connections.
+**Sockets are a shared, scarce resource here.** `CONFIG_LWIP_MAX_SOCKETS` (raised
+to 24 in `sdkconfig.defaults`) is global, and the web server alone asks for 7 via
+`max_open_sockets` while the DNS relay, DoH TLS workers, DoT client, DHCP and SNTP
+hold several more. At the IDF default of 10, a **fourth** concurrent HTTP
+connection was refused, and a browser holding a few keep-alive sockets made the
+panel unreachable entirely (ping fine, HTTP dead). Two consequences:
+
+- Page loads run their requests **sequentially**, so the count stays at one
+  however many panel sections exist. Adding a section means adding it to that
+  chain.
+- `lru_purge_enable` must stay **on**. Turning it off looks better (fail visibly
+  rather than silently resetting the loser) but with no eviction idle keep-alive
+  connections exhaust the pool permanently.
 
 **Every route carries an explicit `admin_only` flag** and all of them go through
 one trampoline, so a new endpoint cannot be added without a decision about who
