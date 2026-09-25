@@ -43,12 +43,18 @@ the old values.
 ### Updating over the network
 
 Once the OTA partition table is in place, `idf.py flash` is only needed for the
-first install. After that the admin panel's Settings tab uploads
-`build/embedwrt.bin`. **That file, not the merged full-flash image** — OTA writes
-one app slot, so the merged image cannot be used. The handler validates the
-uploaded image's `project_name` and rejects anything not built from this project
-(including the bootloader and other projects' apps), which is what stops a
-wrong-but-valid image from being installed and only failing at the next boot.
+first install. After that there are two routes into the same code:
+
+- **Settings → Firmware update** uploads `build/embedwrt.bin` by hand.
+- **The same panel section can check a release feed and install what it finds**,
+  either on a schedule or on a button. See "Automatic updates" below.
+
+Both go through the primitives in `fw_update.c`. **The payload is
+`build/embedwrt.bin`, the app image — not the merged full-flash image**, which
+contains the bootloader and cannot go into an app slot. Two separate checks keep
+that from being a footgun: the handler refuses any image whose `project_name` is
+not `embedwrt`, and the updater only ever picks the release asset named exactly
+`embedwrt.bin`.
 
 Two consequences worth knowing before you change the partition table:
 
@@ -57,6 +63,74 @@ Two consequences worth knowing before you change the partition table:
 - **Keep `nvs` at `0x9000`/`0x6000`.** That offset is what makes the wired flash
   preserve the panel password, leases, DNS rules, port forwards, ACL and device
   records; NVS is not erased by `idf.py flash`. Moving it silently wipes the lot.
+
+### Releasing
+
+```sh
+python3 tools/make_release.py --dry-run   # what would happen
+python3 tools/make_release.py             # tag, push, publish, upload
+```
+
+It reads the version from `PROJECT_VER` in `CMakeLists.txt` and refuses to
+publish if the image's embedded descriptor disagrees, so **bump `PROJECT_VER`
+before releasing**. The reason is not tidiness: the device compares its own
+compiled-in version against the release tag, so a tag that disagrees with the
+image means the device reports the old version forever and considers itself
+always up to date.
+
+Four assets go up: both images and a `.sha256` for each. **The checksum assets
+are required** — the updater refuses a release without `embedwrt.bin.sha256`,
+because it will not flash an image it cannot verify. A release missing that
+asset is not an error anyone sees until an update is attempted, which is why the
+script uploads it every time rather than leaving it to memory.
+
+### Automatic updates
+
+`fw_update.c` holds both the OTA primitives and a background task that asks a
+Gitea release feed whether something newer exists. Settings live in NVS under
+`ota_url` (the `releases/latest` endpoint), `otachk` (hours; 0 = off) and
+`otaauto` (install without asking). Endpoints, all admin-only: `/api/update`
+(state), `/ota/check`, `/ota/install`, `/setotacfg`.
+
+Design points that are deliberate:
+
+- **Version comparison is strict.** Only a greater version counts, so the running
+  build is never an update of itself and auto-install cannot loop.
+- **Auto-install defaults off.** A restart drops every client, so the device
+  announces and waits unless told otherwise.
+- **The checksum is verified before `esp_ota_end`**, and a mismatch aborts the
+  slot without touching the boot partition. Once `esp_ota_end` has run there is
+  no abort left, which is why the order matters.
+- The task blocks until the station has an address; the router tells it via
+  `fw_update_set_online()` rather than the updater reaching into the router's
+  event group.
+
+**Hashing uses the PSA API, not `mbedtls_sha256_*`.** There is no
+`mbedtls/sha256.h` in IDF 6.1 — it moved into the tf-psa-crypto private tree
+behind `MBEDTLS_ALLOW_PRIVATE_ACCESS`, so the familiar calls do not compile. Use
+`psa_hash_setup`/`psa_hash_update`/`psa_hash_finish` with `PSA_ALG_SHA_256`
+(`psa/crypto.h`); the symbols are in libmbedcrypto already and go through the
+chip's SHA acceleration.
+
+**A reply with no `content-length` reads as length 0, not as empty.**
+Gitea answers release metadata with `Transfer-Encoding: chunked`, and
+`esp_http_client_fetch_headers()` returns 0 for that. Treating 0 as a real
+length made every check fail with "short read (5862 of 0 bytes)". With the
+length unknown the reply can also overflow the buffer, and truncating is the
+worse failure: `tag_name` sits *after* the release notes in that JSON, so a
+trimmed document parses cleanly and merely looks like no update is available.
+The reader now errors explicitly instead — `esp_http_client_is_complete_data_received()`
+is what distinguishes a complete reply from a full buffer.
+
+**Security boundary.** The image is verified against a sha256 fetched over the
+same plain-HTTP LAN connection, which catches truncation, flash corruption and
+the wrong file — but **not** an attacker who can rewrite both the image and its
+checksum. Resisting that needs a signature with the public key compiled in
+(Ed25519; verification is milliseconds, unlike the ~2 s TLS handshake this chip
+cannot afford). That is not implemented. In other words the device fetches and
+executes code over an unauthenticated channel by design, so treat the Gitea host
+as trusted. `ota_url` is settable from the panel, but only `http://` URLs are
+accepted and only an admin can set it.
 
 ### Partitions, and why there is no factory slot
 
@@ -109,7 +183,14 @@ because each one caught a real breakage:
   while the served form was broken.
 - **Every `data-i18n` / `t('...')` key must exist in both dictionaries.** The UI
   is bilingual (English/Chinese). Keys reached indirectly, e.g. as values of a
-  lookup table like `DOH_STATE`, are exempted — verify those by hand.
+  lookup table like `DOH_STATE`, are exempted — verify those by hand. This check
+  does **not** strip comments, unlike the apostrophe and line-comment checks, so
+  a literal lookup call written into a comment as an example counts as a
+  reference and fails the build with a key named after whatever you typed. Write
+  prose around it instead. The same parsing exposes an easy way to break a
+  translation: a value whose text ends in an ASCII colon, e.g. `'Installed:'`,
+  looks like the start of the next `key:` pair and swallows the following entry;
+  use a full-width colon or drop it.
 
 **When editing the generator, splice by function boundary and watch the output
 size.** A rewrite of one function once deleted ~20 KB of unrelated JavaScript,
@@ -144,6 +225,7 @@ because it owns the HTML and the HTTP handlers.
 | `ap_acl.c` | AP client allow-list |
 | `clients.c` | Associated-station table with AP-side RSSI, and IP → MAC |
 | `web_auth.c` | Panel sessions, roles, and client-address resolution |
+| `fw_update.c` | The OTA write sequence, shared by the upload handler and the automatic updater; plus the release-check task |
 | `led_off.c` | Blanks the onboard WS2812 at boot (`led_strip_encoder.c` is IDF's, unmodified) |
 
 ### Request and packet flow
@@ -196,8 +278,9 @@ why it cannot lock anyone out.
 
 One NVS namespace, `"storage"`. Strings: `ssid`, `password` (upstream),
 `ap_ssid`, `ap_pass`, `ap_hidden`, `ap_maxconn`, `ap_txpower`, `doh_url`,
-`mdns_host`, `web_user`, `web_pass`. Blobs: `leases`, `dnsrules`, `pforwards`,
-`acl`, `devices`. Single bytes: `guestclaim`, `iotclrvis`.
+`mdns_host`, `web_user`, `web_pass`, `ota_url`. Blobs: `leases`, `dnsrules`,
+`pforwards`, `acl`, `devices`. Single bytes: `guestclaim`, `iotclrvis`,
+`otaauto`. Numbers: `otachk` (u32, hours).
 
 The hot-path tables (`static_leases`, `dns_rules`, `ap_acl`, `devices`) are
 **double buffered**: readers follow an index and never take a lock, writers build
@@ -318,20 +401,34 @@ reboot).
 
 **Verified on hardware, OTA:** a wired flash of the two-slot table booted `ota_0`
 with no manual otadata step; every NVS-backed setting survived that reflash and
-four subsequent OTA cycles byte-for-byte; uploads alternated `ota_0` / `ota_1`
+every OTA cycle since, byte-for-byte; uploads alternated `ota_0` / `ota_1`
 with `/api/version` reporting the new slot; the bootloader rolled back to the
 previous slot after an image that restarted before marking itself valid. Negative
 cases all rejected without disturbing the running firmware: a text file, an
 oversized body (over 4 MB), the bootloader, and a valid app image built from a
 differently-named project.
 
+**Verified on hardware, automatic updates:** the device found `v1.1.0` on its own
+and installed it on request, then installed `v1.1.1` with **no click at all**
+(only a check was triggered, and auto-install did the rest) — version, slot and
+build time all confirmed afterwards. The scheduled check fired unattended about
+two minutes after boot. A deliberately wrong `embedwrt.bin.sha256` was refused at
+"checksum mismatch" with the device left running the old firmware and its config
+untouched; a release missing the checksum asset, and one missing the app image
+while still carrying the merged full-flash image, were both refused with a clear
+reason. Settings survived the reboots that followed, and all four new endpoints
+return 401 to a guest.
+
 **Not verified:** the guest path for *editing* — a guest changing its own lease or
 DNS, and releasing a device it holds — has been exercised over HTTP but not
 through a browser on the AP since the guest view was reworked into collapsible
-cards.
+cards. Rollback has been proven on the manual upload path, not separately on the
+automatic one; both call the same `fw_ota_finish`, so the mechanism is shared,
+but the auto path has not itself been handed a bad image.
 
 **Known limits of the update path:** a panel session lives in RAM, so an OTA
 restart logs the administrator out; that is expected and the UI says so. The
-upload is HTTP, so the image crosses the LAN in the clear. Rollback covers a build
-that crashes at boot, not one that boots but misbehaves — fix the latter by
+image crosses the LAN in the clear on both routes, and its checksum does too, so
+neither is a defence against someone who can rewrite both. Rollback covers a
+build that crashes at boot, not one that boots but misbehaves — fix the latter by
 uploading a good image, the panel is still up.
