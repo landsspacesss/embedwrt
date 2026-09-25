@@ -1283,26 +1283,35 @@ POOL_CHECK:
 
         /*
          * --- local addition: static leases -------------------------------
-         * Applied here, after the pool bookkeeping and its range check but
-         * before parse_options(). That placement is deliberate:
-         *   - create_msg() builds yiaddr from dhcps->client_address, so the
-         *     client is offered the address we just wrote;
-         *   - parse_options() snapshots the same field before comparing it to
-         *     option 50, so a client that requests its static address during
-         *     INIT-REBOOT gets an ACK instead of the NAK it would otherwise
-         *     receive for asking for something outside the pool;
-         *   - the pool entry keeps the real address, so dhcps_get_hostname_on_mac()
-         *     and the by-MAC reuse path stay consistent.
-         * Outside the pool is exactly why this cannot be an address the
-         * allocator might also hand out (see static_leases.h).
+         * Overrides only dhcps->client_address, never the pool entry.
+         *
+         * Writing the leased address into pdhcps_pool->ip is what broke DHCP
+         * completely for a leased client, and it is worth spelling out because
+         * the failure is silent. The by-MAC reuse branch above does
+         * `client_address = pdhcps_pool->ip; goto POOL_CHECK`, and POOL_CHECK
+         * rejects anything outside the dynamic pool with `return 4` - no reply at
+         * all. So once the pool entry held the leased (out-of-pool) address,
+         * every subsequent message from that client was dropped without a
+         * response, and this override was never reached because the early return
+         * sits above it.
+         *
+         * The symptom depends on how the client starts: a client with a cached
+         * lease sends REQUEST (INIT-REBOOT) first, when the pool list is still
+         * empty, so client_address begins in-pool, passes POOL_CHECK, and the ACK
+         * is sent - it works. A client with no cached lease sends DISCOVER first,
+         * which creates the pool entry, and from then on it is stuck: it receives
+         * an OFFER and never an ACK. Changing the AP SSID is what triggers that,
+         * since it makes every client a new client to iOS.
+         *
+         * Keeping the pool entry in-pool is also more correct: the allocator's
+         * bookkeeping stays consistent and a leased address can never be handed
+         * to somebody else, which is the whole reason leases are validated
+         * outside the pool in the first place.
          */
         {
             uint32_t lease_ip = 0;
             if (static_leases_lookup(m->chaddr, &lease_ip)) {
                 dhcps->client_address.addr = lease_ip;
-                if (pdhcps_pool != NULL) {
-                    pdhcps_pool->ip.addr = lease_ip;
-                }
             }
         }
         /* --- end local addition ---------------------------------------- */
