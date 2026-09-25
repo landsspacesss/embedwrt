@@ -54,3 +54,12 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # Send allocations over 4 KB to PSRAM, so TLS record buffers land there too.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# --- Global socket pool. The IDF default of 10 is shared by everything: the web
+# --- server wants up to 7 (its own max_open_sockets), while the DNS relay
+# --- listener, the DoH TLS workers, the DoT client, DHCP and SNTP take several
+# --- more. Measured effect of leaving it at 10: a fourth concurrent HTTP
+# --- connection was already refused, so a browser holding a few keep-alive
+# --- sockets could make the panel unreachable entirely. Raise it so the web
+# --- server can actually have the sockets it asks for.
+CONFIG_LWIP_MAX_SOCKETS=24

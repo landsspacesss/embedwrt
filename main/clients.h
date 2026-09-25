@@ -43,3 +43,12 @@ void clients_note_ip(const uint8_t mac[6], esp_ip4_addr_t ip, const char *hostna
 /* Copy up to `max` associated clients into `out`, refreshing RSSI. Returns the
  * number written. */
 int clients_snapshot(client_info_t *out, int max);
+
+/*
+ * Which associated client holds `ip`? This is how a guest request is attributed:
+ * the panel has no other identity than the request's source address, so the
+ * address has to be mapped back to a MAC before "which device is this?" can be
+ * answered. False when no associated client holds it - which includes a caller
+ * from the upstream LAN, since that address is not in this table.
+ */
+bool clients_mac_for_ip(uint32_t ip, uint8_t mac_out[6]);

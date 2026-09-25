@@ -99,6 +99,22 @@ void clients_note_ip(const uint8_t mac[6], esp_ip4_addr_t ip, const char *hostna
     xSemaphoreGive(s_lock);
 }
 
+bool clients_mac_for_ip(uint32_t ip, uint8_t mac_out[6])
+{
+    if (ip == 0 || mac_out == NULL) {
+        return false;
+    }
+    static client_info_t snap[CLIENTS_MAX];
+    int n = clients_snapshot(snap, CLIENTS_MAX);
+    for (int i = 0; i < n; i++) {
+        if (snap[i].ip_valid && snap[i].ip.addr == ip) {
+            memcpy(mac_out, snap[i].mac, 6);
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * The driver is the authority on who is associated, so the snapshot is driven
  * from esp_wifi_ap_get_sta_list() rather than from our own table: that way a

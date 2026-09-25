@@ -1,6 +1,6 @@
 set(srcs "my_wifi_router.c" "doh_relay.c" "led_off.c" "led_strip_encoder.c"
          "clients.c" "ap_dhcp.c" "static_leases.c" "portmap.c"
-         "dns_rules.c" "dot_client.c" "ap_acl.c" "web_auth.c")
+         "dns_rules.c" "dot_client.c" "ap_acl.c" "web_auth.c" "devices.c")
 
 # The vendored DHCP server and IDF's own define the same dhcps_* symbols, so
 # exactly one may be compiled. CONFIG_USE_OWN_DHCPS pairs with CONFIG_LWIP_DHCPS=n.

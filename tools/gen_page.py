@@ -78,7 +78,8 @@ input:focus,select:focus{border-color:#3b82f6}
     <h1 data-i18n='guest_title'>Limited access</h1>
     <div class='hint' style='margin:10px 0 14px' data-i18n='guest_body'></div>
     <div id='guest-ident' class='hint'></div>
-    <button class='btn' onclick='showLogin()' data-i18n='login_btn'>Log in</button>
+    <div id='guest-devices'></div>
+    <button class='btn' style='margin-top:14px' onclick='showLogin()' data-i18n='login_btn'>Log in</button>
   </div>
   <div id='admin-view'>
   <div class='tabs'>
@@ -238,7 +239,7 @@ en:{
  acl_add_btn:'ADD MAC',acl_enable_btn:'ENFORCE LIST',acl_disable_btn:'STOP ENFORCING',
  acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',
  sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',
- loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',
+ loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',guest_devices:'Devices you can manage',device_offline:'offline',
  login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',
  login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',
  login_failed:'Wrong user or password',login_ok:'Signed in',
@@ -293,7 +294,7 @@ zh:{
  acl_add_btn:'添加 MAC',acl_enable_btn:'启用名单',acl_disable_btn:'停止过滤',
  acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',
  sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',
- loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',
+ loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',guest_devices:'你可以管理的设备',device_offline:'离线',
  login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',
  login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',
  login_failed:'用户名或密码错误',login_ok:'已登录',
@@ -363,8 +364,20 @@ function initPresets(){
    httpd socket limit (max_open_sockets defaults to 7), and the panels for
    whatever loses the race render empty. Chaining keeps the socket count at one
    no matter how many sections are added later, and these requests are tiny on a
-   LAN. The server also has lru_purge_enable off, so an overflow would fail
-   visibly rather than silently. */
+   LAN, so the limit should never be reached at all. */
+/* Fetch several endpoints one at a time and collect the results in order.
+   Serialised for the same reason loadSettings is: the httpd socket limit is 7
+   and a page that opens several panels at once would otherwise reset some. */
+function fetchSeq(urls){
+  var out=[], p=Promise.resolve();
+  urls.forEach(function(u,i){
+    p=p.then(function(){
+      return fetch(u).then(function(r){ return r.ok?r.json():null })
+                    .then(function(d){ out[i]=d });
+    });
+  });
+  return p.then(function(){ return out });
+}
 function runSequential(fns,gen){
   var p=Promise.resolve();
   fns.forEach(function(f){
@@ -471,57 +484,134 @@ function toggleClient(id){
   el.style.display='block';
   loadClientDetail(el,id);
 }
+/* The lease + DNS half of a device card. Shared by the admin Clients tab and the
+   guest view, so both edit a device the same way. */
+function deviceEditHtml(id,mac,lease,rule,L,curIp){
+  var suggest=curIp||'';
+  if(lease){suggest=lease.ip}
+  else if(L&&L.pool_known){
+    var q=L.pool_last.split('.');
+    suggest=q[0]+'.'+q[1]+'.'+q[2]+'.'+(parseInt(q[3],10)+1);
+  }
+  var h="";
+  h+="<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>";
+  h+="<label>"+t('lease_for')+" <span style='color:"+(lease?'#15803d':'#94a3b8')+"'>("
+    +(lease?t('set_mark'):t('not_set'))+")</span></label>";
+  h+="<div class='row'><div><input type='text' id='cd-ip-"+id+"' value='"+suggest+"'></div>"
+    +"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdSaveLease(\""+mac+"\",\""+id+"\")'>"+t('save_btn')+"</button></div>"
+    +(lease?"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdDelLease(\""+mac+"\",\""+id+"\")'>"+t('remove_btn')+"</button></div>":"")
+    +"</div>";
+  if(L&&L.pool_known){
+    h+="<div class='hint' style='margin:6px 0 0'>"+t('pool_free')+" "+L.pool_first+"-"+L.pool_last+" "+t('pool_in_use')+"</div>";
+  }
+  h+="</div>";
+  h+="<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>";
+  h+="<label>"+t('dns_for')+" <span style='color:"+(rule?'#15803d':'#94a3b8')+"'>("
+    +(rule?t('set_mark'):t('use_default_dns'))+")</span></label>";
+  h+="<div class='row'><div><select id='cd-mode-"+id+"'>";
+  ['doh','dot','dns'].forEach(function(m){
+    h+="<option value='"+m+"'"+(rule&&rule.mode===m?' selected':'')+">"+t(CD_MODEKEY[m])+"</option>";
+  });
+  h+="</select></div></div>";
+  h+="<div class='form-group' style='margin-top:8px'><label>"+t('preset_label')+"</label>"
+    +"<select id='cd-preset-"+id+"'></select></div>";
+  h+="<div class='row form-group'><div><input type='text' id='cd-addr-"+id+"' value='"
+    +(rule?rule.addr:'')+"' placeholder='223.5.5.5'></div></div>";
+  h+="<div class='row'><div><button class='refresh-btn' style='width:100%' onclick='cdSaveRule(\""+mac+"\",\""+id+"\")'>"+t('save_btn')+"</button></div>"
+    +(rule?"<div><button class='refresh-btn' style='width:100%' onclick='cdDelRule(\""+mac+"\",\""+id+"\")'>"+t('remove_btn')+"</button></div>":"")
+    +"</div>";
+  h+="<div class='hint' style='margin:8px 0 0' id='cd-msg-"+id+"'></div>";
+  h+="</div>";
+  return h;
+}
+/* The admin-only half: IoT flag and owner. */
+function deviceAttrHtml(id,mac,rec,clients){
+  var h="<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>";
+  h+="<label><input type='checkbox' id='cd-iot-"+id+"' style='width:auto;margin-right:6px'"
+    +((rec&&rec.iot)?' checked':'')+">"+t('iot_label')+"</label>";
+  h+="<div class='hint' style='margin:6px 0 0'>"+t('iot_hint')+"</div>";
+  h+="<div class='form-group' style='margin:10px 0 0'><label>"+t('owner_label')+"</label><select id='cd-owner-"+id+"'>";
+  h+="<option value=''>"+t('owner_none')+"</option>";
+  (clients||[]).forEach(function(c){
+    if(c.mac===mac){return}
+    h+="<option value='"+c.mac+"'"+(rec&&rec.owner===c.mac?' selected':'')+">"
+      +c.mac+(c.host?(' ('+c.host+')'):'')+"</option>";
+  });
+  h+="</select></div>";
+  h+="<button class='refresh-btn' style='width:100%' onclick='cdSaveDevice(\""+mac+"\",\""+id+"\")'>"+t('save_dev_btn')+"</button>";
+  h+="</div>";
+  return h;
+}
 function loadClientDetail(el,id,msg)  {
   el.innerHTML='<div class="loading">'+t('loading')+'</div>';
-  Promise.all([
-    fetch('/api/leases').then(function(r){return r.json()}),
-    fetch('/api/dnsrules').then(function(r){return r.json()})
-  ]).then(function(res){
-    var L=res[0],R=res[1];
-    var mac=el.getAttribute('data-mac'),curIp=el.getAttribute('data-ip');
-    var lease=null;L.leases.forEach(function(x){if(x.mac===mac){lease=x}});
-    var rule=null;R.rules.forEach(function(x){if(x.mac===mac){rule=x}});
-    var suggest=curIp;
-    if(lease){suggest=lease.ip}
-    else if(L.pool_known){
-      var q=L.pool_last.split('.');
-      suggest=q[0]+'.'+q[1]+'.'+q[2]+'.'+(parseInt(q[3],10)+1);
-    }
-    var h="";
-    h+="<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>";
-    h+="<label>"+t('lease_for')+" <span style='color:"+(lease?'#15803d':'#94a3b8')+"'>("
-      +(lease?t('set_mark'):t('not_set'))+")</span></label>";
-    h+="<div class='row'><div><input type='text' id='cd-ip-"+id+"' value='"+suggest+"'></div>"
-      +"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdSaveLease(\""+mac+"\",\""+id+"\")'>"+t('save_btn')+"</button></div>"
-      +(lease?"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdDelLease(\""+mac+"\",\""+id+"\")'>"+t('remove_btn')+"</button></div>":"")
-      +"</div>";
-    if(L.pool_known){
-      h+="<div class='hint' style='margin:6px 0 0'>"+t('pool_free')+" "+L.pool_first+"-"+L.pool_last+" "+t('pool_in_use')+"</div>";
-    }
-    h+="</div>";
-    h+="<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>";
-    h+="<label>"+t('dns_for')+" <span style='color:"+(rule?'#15803d':'#94a3b8')+"'>("
-      +(rule?t('set_mark'):t('use_default_dns'))+")</span></label>";
-    h+="<div class='row'><div><select id='cd-mode-"+id+"'>";
-    ['doh','dot','dns'].forEach(function(m){
-      h+="<option value='"+m+"'"+(rule&&rule.mode===m?' selected':'')+">"+t(CD_MODEKEY[m])+"</option>";
-    });
-    h+="</select></div></div>";
-    h+="<div class='form-group' style='margin-top:8px'><label>"+t('preset_label')+"</label>"
-      +"<select id='cd-preset-"+id+"'></select></div>";
-    h+="<div class='row form-group'><div><input type='text' id='cd-addr-"+id+"' value='"
-      +(rule?rule.addr:'')+"' placeholder='223.5.5.5'></div></div>";
-    h+="<div class='row'><div><button class='refresh-btn' style='width:100%' onclick='cdSaveRule(\""+mac+"\",\""+id+"\")'>"+t('save_btn')+"</button></div>"
-      +(rule?"<div><button class='refresh-btn' style='width:100%' onclick='cdDelRule(\""+mac+"\",\""+id+"\")'>"+t('remove_btn')+"</button></div>":"")
-      +"</div>";
-    h+="<div class='hint' style='margin:8px 0 0' id='cd-msg-"+id+"'></div>";
-    h+="</div>";
-    el.innerHTML=h;
+  var mac=el.getAttribute('data-mac'),curIp=el.getAttribute('data-ip');
+  fetchSeq(['/api/leases','/api/dnsrules','/api/devices','/api/clients']).then(function(res){
+    var L=res[0]||{},R=res[1]||{},D=res[2]||{},C=res[3]||[];
+    var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});
+    var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});
+    var rec=null;(D.devices||[]).forEach(function(x){if(x.mac===mac){rec=x}});
+    el.innerHTML=deviceEditHtml(id,mac,lease,rule,L,curIp)+deviceAttrHtml(id,mac,rec,C);
     wirePresets(document.getElementById('cd-mode-'+id),
                 document.getElementById('cd-preset-'+id),
                 document.getElementById('cd-addr-'+id));
     if(msg){cdMsg(id,msg.ok,msg.txt)}
   }).catch(function(){el.innerHTML='<div class="loading">'+t('failed_load')+'</div>'});
+}
+function cdSaveDevice(mac,id){
+  var rec=null,cb=document.getElementById('cd-iot-'+id);
+  var iot=(cb&&cb.checked)?'1':'0';
+  var owner=(document.getElementById('cd-owner-'+id)||{}).value||'';
+  var m=document.getElementById('cd-msg-'+id);
+  fetch('/device/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'mac='+encodeURIComponent(mac)+'&iot='+iot+'&owner='+encodeURIComponent(owner)})
+  .then(function(r){return r.text().then(function(x){
+    if(m){m.innerHTML=r.ok?('<span style="color:#15803d">'+t('saved')+'</span>')
+                         :('<span style="color:#b91c1c">'+t('rejected')+': '+x+'</span>')}
+  })});
+}
+/* The guest's own devices: its own entry plus the IoT devices it owns. Driven by
+   /api/devices (which includes offline ones) unioned with /api/clients (which has
+   the live info), since a device can be owned while not currently associated. */
+function loadGuestView(){
+  var box=document.getElementById('guest-devices');
+  box.innerHTML='<div class="loading">'+t('loading')+'</div>';
+  fetchSeq(['/api/devices','/api/clients','/api/leases','/api/dnsrules']).then(function(res){
+    var D=res[0]||{},C=res[1]||[],L=res[2]||{},R=res[3]||{};
+    var live={};C.forEach(function(c){live[c.mac]=c});
+    var seen={},order=[];
+    function add(mac){if(mac&&!seen[mac]){seen[mac]=1;order.push(mac)}}
+    (D.devices||[]).forEach(function(d){add(d.mac)});
+    C.forEach(function(c){add(c.mac)});
+    if(!order.length){
+      box.innerHTML='<div class="hint">'+t('guest_noident')+'</div>';
+      return;
+    }
+    var h="<h2>"+t('guest_devices')+"</h2>";
+    order.forEach(function(mac){
+      var id=mac.replace(/:/g,'');
+      var c=live[mac];
+      var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});
+      var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});
+      var head=(c&&c.host)?c.host:t('unknown');
+      h+="<div style='border:1px solid #e2e8f0;border-radius:8px;margin-bottom:12px;overflow:hidden'>";
+      h+="<div style='padding:10px 14px;background:#f8fafc'>";
+      h+="<div style='display:flex;justify-content:space-between;align-items:center;gap:8px'>"
+        +"<span class='mono' style='font-size:12px'>"+mac+"</span>"
+        +"<span style='font-size:12px;color:"+(c?'#15803d':'#94a3b8')+"'>"
+        +(c?(c.ip||'?'):t('device_offline'))+"</span></div>";
+      h+="<div style='font-size:12px;color:#475569;margin-top:3px'>"+head+"</div>";
+      h+="</div>";
+      h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');
+      h+="</div>";
+    });
+    box.innerHTML=h;
+    order.forEach(function(mac){
+      var id=mac.replace(/:/g,'');
+      wirePresets(document.getElementById('cd-mode-'+id),
+                  document.getElementById('cd-preset-'+id),
+                  document.getElementById('cd-addr-'+id));
+    });
+  }).catch(function(){box.innerHTML='<div class="loading">'+t('failed_load')+'</div>'});
 }
 function cdMsg(id,ok,txt){
   var m=document.getElementById('cd-msg-'+id);
@@ -900,7 +990,8 @@ function loadSession(){
       init();
     }else{
       var g=document.getElementById('guest-ident');
-      g.innerHTML=SESSION.client_ip ? (t('guest_you')+': <b>'+SESSION.client_ip+'</b>') : t('guest_noident');
+      g.innerHTML=SESSION.client_ip ? (t('guest_you')+': <b>'+SESSION.client_ip+'</b>') : '';
+      loadGuestView();
     }
     applyLang();   /* re-label the buttons now that the role is known */
   }).catch(function(){

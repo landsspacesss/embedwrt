@@ -24,6 +24,7 @@
 #include "esp_tls_crypto.h"   /* esp_crypto_base64_encode, for HTTP Basic auth */
 #include "ap_acl.h"
 #include "web_auth.h"
+#include "devices.h"
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
@@ -216,6 +217,32 @@ static esp_err_t auth_trampoline(httpd_req_t *req)
         return ESP_OK;
     }
     return r->real(req);
+}
+
+/*
+ * Which device is this request coming from, and what may it touch?
+ *
+ * Admins bypass all of this. A guest is identified solely by its source address,
+ * so a caller outside the AP subnet has no identity and owns nothing - the
+ * correct outcome, not a gap.
+ */
+static bool caller_mac(httpd_req_t *req, uint8_t mac_out[6])
+{
+    uint32_t ip = 0;
+    if (!web_auth_client_ip(req, &ip)) {
+        return false;
+    }
+    return clients_mac_for_ip(ip, mac_out);
+}
+
+/* Admins may touch anything; a guest only what devices.c says it may. */
+static bool caller_may_touch(httpd_req_t *req, const uint8_t target[6])
+{
+    if (web_auth_role_of(req) == WEB_ROLE_ADMIN) {
+        return true;
+    }
+    uint8_t me[6] = {0};
+    return caller_mac(req, me) && devices_visible(target, me);
 }
 
 /* ======================= AP name ======================= */
@@ -753,7 +780,8 @@ static const char *html_page =
 "    <h1 data-i18n='guest_title'>Limited access</h1>"
 "    <div class='hint' style='margin:10px 0 14px' data-i18n='guest_body'></div>"
 "    <div id='guest-ident' class='hint'></div>"
-"    <button class='btn' onclick='showLogin()' data-i18n='login_btn'>Log in</button>"
+"    <div id='guest-devices'></div>"
+"    <button class='btn' style='margin-top:14px' onclick='showLogin()' data-i18n='login_btn'>Log in</button>"
 "  </div>"
 "  <div id='admin-view'>"
 "  <div class='tabs'>"
@@ -913,7 +941,7 @@ static const char *html_page =
 " acl_add_btn:'ADD MAC',acl_enable_btn:'ENFORCE LIST',acl_disable_btn:'STOP ENFORCING',"
 " acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',"
 " sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
-" loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',"
+" loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',guest_devices:'Devices you can manage',device_offline:'offline',"
 " login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',"
 " login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',"
 " login_failed:'Wrong user or password',login_ok:'Signed in',"
@@ -968,7 +996,7 @@ static const char *html_page =
 " acl_add_btn:'添加 MAC',acl_enable_btn:'启用名单',acl_disable_btn:'停止过滤',"
 " acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',"
 " sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
-" loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',"
+" loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',guest_devices:'你可以管理的设备',device_offline:'离线',"
 " login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',"
 " login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',"
 " login_failed:'用户名或密码错误',login_ok:'已登录',"
@@ -1038,8 +1066,20 @@ static const char *html_page =
 "   httpd socket limit (max_open_sockets defaults to 7), and the panels for"
 "   whatever loses the race render empty. Chaining keeps the socket count at one"
 "   no matter how many sections are added later, and these requests are tiny on a"
-"   LAN. The server also has lru_purge_enable off, so an overflow would fail"
-"   visibly rather than silently. */"
+"   LAN, so the limit should never be reached at all. */"
+"/* Fetch several endpoints one at a time and collect the results in order."
+"   Serialised for the same reason loadSettings is: the httpd socket limit is 7"
+"   and a page that opens several panels at once would otherwise reset some. */"
+"function fetchSeq(urls){"
+"  var out=[], p=Promise.resolve();"
+"  urls.forEach(function(u,i){"
+"    p=p.then(function(){"
+"      return fetch(u).then(function(r){ return r.ok?r.json():null })"
+"                    .then(function(d){ out[i]=d });"
+"    });"
+"  });"
+"  return p.then(function(){ return out });"
+"}"
 "function runSequential(fns,gen){"
 "  var p=Promise.resolve();"
 "  fns.forEach(function(f){"
@@ -1146,57 +1186,134 @@ static const char *html_page =
 "  el.style.display='block';"
 "  loadClientDetail(el,id);"
 "}"
+"/* The lease + DNS half of a device card. Shared by the admin Clients tab and the"
+"   guest view, so both edit a device the same way. */"
+"function deviceEditHtml(id,mac,lease,rule,L,curIp){"
+"  var suggest=curIp||'';"
+"  if(lease){suggest=lease.ip}"
+"  else if(L&&L.pool_known){"
+"    var q=L.pool_last.split('.');"
+"    suggest=q[0]+'.'+q[1]+'.'+q[2]+'.'+(parseInt(q[3],10)+1);"
+"  }"
+"  var h=\"\";"
+"  h+=\"<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>\";"
+"  h+=\"<label>\"+t('lease_for')+\" <span style='color:\"+(lease?'#15803d':'#94a3b8')+\"'>(\""
+"    +(lease?t('set_mark'):t('not_set'))+\")</span></label>\";"
+"  h+=\"<div class='row'><div><input type='text' id='cd-ip-\"+id+\"' value='\"+suggest+\"'></div>\""
+"    +\"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdSaveLease(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('save_btn')+\"</button></div>\""
+"    +(lease?\"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdDelLease(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('remove_btn')+\"</button></div>\":\"\")"
+"    +\"</div>\";"
+"  if(L&&L.pool_known){"
+"    h+=\"<div class='hint' style='margin:6px 0 0'>\"+t('pool_free')+\" \"+L.pool_first+\"-\"+L.pool_last+\" \"+t('pool_in_use')+\"</div>\";"
+"  }"
+"  h+=\"</div>\";"
+"  h+=\"<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>\";"
+"  h+=\"<label>\"+t('dns_for')+\" <span style='color:\"+(rule?'#15803d':'#94a3b8')+\"'>(\""
+"    +(rule?t('set_mark'):t('use_default_dns'))+\")</span></label>\";"
+"  h+=\"<div class='row'><div><select id='cd-mode-\"+id+\"'>\";"
+"  ['doh','dot','dns'].forEach(function(m){"
+"    h+=\"<option value='\"+m+\"'\"+(rule&&rule.mode===m?' selected':'')+\">\"+t(CD_MODEKEY[m])+\"</option>\";"
+"  });"
+"  h+=\"</select></div></div>\";"
+"  h+=\"<div class='form-group' style='margin-top:8px'><label>\"+t('preset_label')+\"</label>\""
+"    +\"<select id='cd-preset-\"+id+\"'></select></div>\";"
+"  h+=\"<div class='row form-group'><div><input type='text' id='cd-addr-\"+id+\"' value='\""
+"    +(rule?rule.addr:'')+\"' placeholder='223.5.5.5'></div></div>\";"
+"  h+=\"<div class='row'><div><button class='refresh-btn' style='width:100%' onclick='cdSaveRule(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('save_btn')+\"</button></div>\""
+"    +(rule?\"<div><button class='refresh-btn' style='width:100%' onclick='cdDelRule(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('remove_btn')+\"</button></div>\":\"\")"
+"    +\"</div>\";"
+"  h+=\"<div class='hint' style='margin:8px 0 0' id='cd-msg-\"+id+\"'></div>\";"
+"  h+=\"</div>\";"
+"  return h;"
+"}"
+"/* The admin-only half: IoT flag and owner. */"
+"function deviceAttrHtml(id,mac,rec,clients){"
+"  var h=\"<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>\";"
+"  h+=\"<label><input type='checkbox' id='cd-iot-\"+id+\"' style='width:auto;margin-right:6px'\""
+"    +((rec&&rec.iot)?' checked':'')+\">\"+t('iot_label')+\"</label>\";"
+"  h+=\"<div class='hint' style='margin:6px 0 0'>\"+t('iot_hint')+\"</div>\";"
+"  h+=\"<div class='form-group' style='margin:10px 0 0'><label>\"+t('owner_label')+\"</label><select id='cd-owner-\"+id+\"'>\";"
+"  h+=\"<option value=''>\"+t('owner_none')+\"</option>\";"
+"  (clients||[]).forEach(function(c){"
+"    if(c.mac===mac){return}"
+"    h+=\"<option value='\"+c.mac+\"'\"+(rec&&rec.owner===c.mac?' selected':'')+\">\""
+"      +c.mac+(c.host?(' ('+c.host+')'):'')+\"</option>\";"
+"  });"
+"  h+=\"</select></div>\";"
+"  h+=\"<button class='refresh-btn' style='width:100%' onclick='cdSaveDevice(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('save_dev_btn')+\"</button>\";"
+"  h+=\"</div>\";"
+"  return h;"
+"}"
 "function loadClientDetail(el,id,msg)  {"
 "  el.innerHTML='<div class=\"loading\">'+t('loading')+'</div>';"
-"  Promise.all(["
-"    fetch('/api/leases').then(function(r){return r.json()}),"
-"    fetch('/api/dnsrules').then(function(r){return r.json()})"
-"  ]).then(function(res){"
-"    var L=res[0],R=res[1];"
-"    var mac=el.getAttribute('data-mac'),curIp=el.getAttribute('data-ip');"
-"    var lease=null;L.leases.forEach(function(x){if(x.mac===mac){lease=x}});"
-"    var rule=null;R.rules.forEach(function(x){if(x.mac===mac){rule=x}});"
-"    var suggest=curIp;"
-"    if(lease){suggest=lease.ip}"
-"    else if(L.pool_known){"
-"      var q=L.pool_last.split('.');"
-"      suggest=q[0]+'.'+q[1]+'.'+q[2]+'.'+(parseInt(q[3],10)+1);"
-"    }"
-"    var h=\"\";"
-"    h+=\"<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>\";"
-"    h+=\"<label>\"+t('lease_for')+\" <span style='color:\"+(lease?'#15803d':'#94a3b8')+\"'>(\""
-"      +(lease?t('set_mark'):t('not_set'))+\")</span></label>\";"
-"    h+=\"<div class='row'><div><input type='text' id='cd-ip-\"+id+\"' value='\"+suggest+\"'></div>\""
-"      +\"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdSaveLease(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('save_btn')+\"</button></div>\""
-"      +(lease?\"<div style='flex:0 0 auto'><button class='refresh-btn' onclick='cdDelLease(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('remove_btn')+\"</button></div>\":\"\")"
-"      +\"</div>\";"
-"    if(L.pool_known){"
-"      h+=\"<div class='hint' style='margin:6px 0 0'>\"+t('pool_free')+\" \"+L.pool_first+\"-\"+L.pool_last+\" \"+t('pool_in_use')+\"</div>\";"
-"    }"
-"    h+=\"</div>\";"
-"    h+=\"<div style='padding:12px 14px;background:#f8fafc;border-top:1px solid #e2e8f0'>\";"
-"    h+=\"<label>\"+t('dns_for')+\" <span style='color:\"+(rule?'#15803d':'#94a3b8')+\"'>(\""
-"      +(rule?t('set_mark'):t('use_default_dns'))+\")</span></label>\";"
-"    h+=\"<div class='row'><div><select id='cd-mode-\"+id+\"'>\";"
-"    ['doh','dot','dns'].forEach(function(m){"
-"      h+=\"<option value='\"+m+\"'\"+(rule&&rule.mode===m?' selected':'')+\">\"+t(CD_MODEKEY[m])+\"</option>\";"
-"    });"
-"    h+=\"</select></div></div>\";"
-"    h+=\"<div class='form-group' style='margin-top:8px'><label>\"+t('preset_label')+\"</label>\""
-"      +\"<select id='cd-preset-\"+id+\"'></select></div>\";"
-"    h+=\"<div class='row form-group'><div><input type='text' id='cd-addr-\"+id+\"' value='\""
-"      +(rule?rule.addr:'')+\"' placeholder='223.5.5.5'></div></div>\";"
-"    h+=\"<div class='row'><div><button class='refresh-btn' style='width:100%' onclick='cdSaveRule(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('save_btn')+\"</button></div>\""
-"      +(rule?\"<div><button class='refresh-btn' style='width:100%' onclick='cdDelRule(\\\"\"+mac+\"\\\",\\\"\"+id+\"\\\")'>\"+t('remove_btn')+\"</button></div>\":\"\")"
-"      +\"</div>\";"
-"    h+=\"<div class='hint' style='margin:8px 0 0' id='cd-msg-\"+id+\"'></div>\";"
-"    h+=\"</div>\";"
-"    el.innerHTML=h;"
+"  var mac=el.getAttribute('data-mac'),curIp=el.getAttribute('data-ip');"
+"  fetchSeq(['/api/leases','/api/dnsrules','/api/devices','/api/clients']).then(function(res){"
+"    var L=res[0]||{},R=res[1]||{},D=res[2]||{},C=res[3]||[];"
+"    var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});"
+"    var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});"
+"    var rec=null;(D.devices||[]).forEach(function(x){if(x.mac===mac){rec=x}});"
+"    el.innerHTML=deviceEditHtml(id,mac,lease,rule,L,curIp)+deviceAttrHtml(id,mac,rec,C);"
 "    wirePresets(document.getElementById('cd-mode-'+id),"
 "                document.getElementById('cd-preset-'+id),"
 "                document.getElementById('cd-addr-'+id));"
 "    if(msg){cdMsg(id,msg.ok,msg.txt)}"
 "  }).catch(function(){el.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function cdSaveDevice(mac,id){"
+"  var rec=null,cb=document.getElementById('cd-iot-'+id);"
+"  var iot=(cb&&cb.checked)?'1':'0';"
+"  var owner=(document.getElementById('cd-owner-'+id)||{}).value||'';"
+"  var m=document.getElementById('cd-msg-'+id);"
+"  fetch('/device/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'mac='+encodeURIComponent(mac)+'&iot='+iot+'&owner='+encodeURIComponent(owner)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    if(m){m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>')"
+"                         :('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>')}"
+"  })});"
+"}"
+"/* The guest's own devices: its own entry plus the IoT devices it owns. Driven by"
+"   /api/devices (which includes offline ones) unioned with /api/clients (which has"
+"   the live info), since a device can be owned while not currently associated. */"
+"function loadGuestView(){"
+"  var box=document.getElementById('guest-devices');"
+"  box.innerHTML='<div class=\"loading\">'+t('loading')+'</div>';"
+"  fetchSeq(['/api/devices','/api/clients','/api/leases','/api/dnsrules']).then(function(res){"
+"    var D=res[0]||{},C=res[1]||[],L=res[2]||{},R=res[3]||{};"
+"    var live={};C.forEach(function(c){live[c.mac]=c});"
+"    var seen={},order=[];"
+"    function add(mac){if(mac&&!seen[mac]){seen[mac]=1;order.push(mac)}}"
+"    (D.devices||[]).forEach(function(d){add(d.mac)});"
+"    C.forEach(function(c){add(c.mac)});"
+"    if(!order.length){"
+"      box.innerHTML='<div class=\"hint\">'+t('guest_noident')+'</div>';"
+"      return;"
+"    }"
+"    var h=\"<h2>\"+t('guest_devices')+\"</h2>\";"
+"    order.forEach(function(mac){"
+"      var id=mac.replace(/:/g,'');"
+"      var c=live[mac];"
+"      var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});"
+"      var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});"
+"      var head=(c&&c.host)?c.host:t('unknown');"
+"      h+=\"<div style='border:1px solid #e2e8f0;border-radius:8px;margin-bottom:12px;overflow:hidden'>\";"
+"      h+=\"<div style='padding:10px 14px;background:#f8fafc'>\";"
+"      h+=\"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px'>\""
+"        +\"<span class='mono' style='font-size:12px'>\"+mac+\"</span>\""
+"        +\"<span style='font-size:12px;color:\"+(c?'#15803d':'#94a3b8')+\"'>\""
+"        +(c?(c.ip||'?'):t('device_offline'))+\"</span></div>\";"
+"      h+=\"<div style='font-size:12px;color:#475569;margin-top:3px'>\"+head+\"</div>\";"
+"      h+=\"</div>\";"
+"      h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');"
+"      h+=\"</div>\";"
+"    });"
+"    box.innerHTML=h;"
+"    order.forEach(function(mac){"
+"      var id=mac.replace(/:/g,'');"
+"      wirePresets(document.getElementById('cd-mode-'+id),"
+"                  document.getElementById('cd-preset-'+id),"
+"                  document.getElementById('cd-addr-'+id));"
+"    });"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
 "}"
 "function cdMsg(id,ok,txt){"
 "  var m=document.getElementById('cd-msg-'+id);"
@@ -1575,7 +1692,8 @@ static const char *html_page =
 "      init();"
 "    }else{"
 "      var g=document.getElementById('guest-ident');"
-"      g.innerHTML=SESSION.client_ip ? (t('guest_you')+': <b>'+SESSION.client_ip+'</b>') : t('guest_noident');"
+"      g.innerHTML=SESSION.client_ip ? (t('guest_you')+': <b>'+SESSION.client_ip+'</b>') : '';"
+"      loadGuestView();"
 "    }"
 "    applyLang();   /* re-label the buttons now that the role is known */"
 "  }).catch(function(){"
@@ -1828,6 +1946,9 @@ static esp_err_t leases_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "impl", ap_dhcp_impl());
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < n; i++) {
+        if (!caller_may_touch(req, list[i].mac)) {
+            continue;
+        }
         cJSON *o = cJSON_CreateObject();
         char mac[18], ip[16];
         snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
@@ -1885,6 +2006,13 @@ static esp_err_t add_lease_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC (use aa:bb:cc:dd:ee:ff)");
         return ESP_FAIL;
     }
+    /* Device-scoped: an admin may change any device, a guest only its own and the
+     * IoT devices it owns. Refusing here rather than filtering silently, because
+     * a write that was quietly ignored would be worse than an error. */
+    if (!caller_may_touch(req, mac)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "not your device");
+        return ESP_FAIL;
+    }
     esp_ip4_addr_t ip;
     if (esp_netif_str_to_ip4(ip_s, &ip) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad IPv4 address");
@@ -1938,6 +2066,13 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
     uint8_t mac[6];
     if (!parse_mac(mac_s, mac)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    /* Device-scoped: an admin may change any device, a guest only its own and the
+     * IoT devices it owns. Refusing here rather than filtering silently, because
+     * a write that was quietly ignored would be worse than an error. */
+    if (!caller_may_touch(req, mac)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "not your device");
         return ESP_FAIL;
     }
     if (static_leases_remove(mac) != ESP_OK) {
@@ -2229,6 +2364,123 @@ static esp_err_t set_ssid_post_handler(httpd_req_t *req)
 }
 
 /* Who am I, and is authentication even on? Drives the header and the UI. */
+/*
+ * Device attributes. An admin sees every record and can edit them; a guest sees
+ * only the records it is allowed to (its own device and the IoT devices it owns),
+ * which is how it learns about an IoT device that is currently offline and so
+ * absent from /api/clients.
+ */
+static esp_err_t devices_get_handler(httpd_req_t *req)
+{
+    device_rec_t all[DEVICES_MAX];
+    int n = devices_records(all, DEVICES_MAX);
+    bool admin = (web_auth_role_of(req) == WEB_ROLE_ADMIN);
+    uint8_t me[6] = {0};
+    bool have_me = caller_mac(req, me);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        if (!admin) {
+            if (!have_me || !devices_visible(all[i].mac, me)) {
+                continue;
+            }
+        }
+        cJSON *o = cJSON_CreateObject();
+        char b[18];
+        snprintf(b, sizeof(b), MACSTR, MAC2STR(all[i].mac));
+        cJSON_AddStringToObject(o, "mac", b);
+        cJSON_AddBoolToObject(o, "iot", all[i].iot);
+        if (devices_mac_is_set(all[i].owner)) {
+            snprintf(b, sizeof(b), MACSTR, MAC2STR(all[i].owner));
+            cJSON_AddStringToObject(o, "owner", b);
+        } else {
+            cJSON_AddStringToObject(o, "owner", "");
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "devices", arr);
+    cJSON_AddBoolToObject(root, "admin", admin);
+    if (have_me) {
+        char b[18];
+        snprintf(b, sizeof(b), MACSTR, MAC2STR(me));
+        cJSON_AddStringToObject(root, "me", b);
+    } else {
+        cJSON_AddStringToObject(root, "me", "");
+    }
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* Admin only: flag a device as IoT and/or set its owner. */
+static esp_err_t set_device_post_handler(httpd_req_t *req)
+{
+    char buf[192] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_mac[64] = {0}, raw_iot[8] = {0}, raw_owner[64] = {0};
+    if (httpd_query_key_value(buf, "mac", raw_mac, sizeof(raw_mac)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    httpd_query_key_value(buf, "iot", raw_iot, sizeof(raw_iot));
+
+    char mac_s[32] = {0}, owner_s[32] = {0};
+    url_decode(mac_s, sizeof(mac_s), raw_mac);
+    url_decode(owner_s, sizeof(owner_s), raw_owner);
+
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    bool iot = (raw_iot[0] == '1' || strcasecmp(raw_iot, "true") == 0);
+
+    /* A missing `owner` field means "leave ownership alone"; an explicitly empty
+     * one means "clear it". Without that distinction a caller that only meant to
+     * toggle the IoT flag would silently wipe a user-visible assignment - which
+     * is exactly what an early version of this handler did. */
+    bool owner_given = (httpd_query_key_value(buf, "owner", raw_owner,
+                                              sizeof(raw_owner)) == ESP_OK);
+    uint8_t owner[6];
+    const uint8_t *owner_p = NULL;
+    if (owner_given && owner_s[0] != '\0') {
+        if (!parse_mac(owner_s, owner)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad owner MAC");
+            return ESP_FAIL;
+        }
+        if (memcmp(owner, mac, 6) == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a device cannot own itself");
+            return ESP_FAIL;
+        }
+        owner_p = owner;
+    }
+
+    esp_err_t err = owner_given ? devices_set(mac, iot, owner_p)
+                                : devices_set_iot(mac, iot);
+    if (err == ESP_ERR_NO_MEM) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "device table full");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t session_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -2438,6 +2690,9 @@ static esp_err_t dnsrules_get_handler(httpd_req_t *req)
 
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < n; i++) {
+        if (!caller_may_touch(req, list[i].mac)) {
+            continue;
+        }
         cJSON *o = cJSON_CreateObject();
         char mac[18];
         snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
@@ -2483,6 +2738,13 @@ static esp_err_t set_dnsrule_post_handler(httpd_req_t *req)
     uint8_t mac[6];
     if (!parse_mac(mac_s, mac)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC (use aa:bb:cc:dd:ee:ff)");
+        return ESP_FAIL;
+    }
+    /* Device-scoped: an admin may change any device, a guest only its own and the
+     * IoT devices it owns. Refusing here rather than filtering silently, because
+     * a write that was quietly ignored would be worse than an error. */
+    if (!caller_may_touch(req, mac)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "not your device");
         return ESP_FAIL;
     }
     uint8_t mode;
@@ -2536,6 +2798,13 @@ static esp_err_t del_dnsrule_post_handler(httpd_req_t *req)
     uint8_t mac[6];
     if (!parse_mac(mac_s, mac)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    /* Device-scoped: an admin may change any device, a guest only its own and the
+     * IoT devices it owns. Refusing here rather than filtering silently, because
+     * a write that was quietly ignored would be worse than an error. */
+    if (!caller_may_touch(req, mac)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "not your device");
         return ESP_FAIL;
     }
     if (dns_rules_remove(mac) != ESP_OK) {
@@ -2814,6 +3083,12 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     cJSON *arr = cJSON_CreateArray();
     int64_t now_us = esp_timer_get_time();
     for (int i = 0; i < n; i++) {
+        /* A guest sees its own device and the IoT devices it owns; an admin
+         * sees everything. Filtering here rather than refusing the request keeps
+         * one endpoint serving both roles. */
+        if (!caller_may_touch(req, list[i].mac)) {
+            continue;
+        }
         cJSON *o = cJSON_CreateObject();
         char mac[18];
         snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
@@ -2990,14 +3265,22 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 52;
+    cfg.max_uri_handlers = 56;
     cfg.stack_size = 6144;
-    /* Page loads serialise their requests, so the default socket limit of 7 is
-     * not reached. Purging stays off deliberately: with it on, an overflow
-     * silently resets the connections that lose the race and the corresponding
-     * panels render empty with no error - which is exactly how the DNS preset
-     * work surfaced this. Better to fail visibly if the limit is ever hit. */
-    cfg.lru_purge_enable = false;
+    /*
+     * Purge the least-recently-used session when the socket pool is full.
+     *
+     * This must stay ON. Turning it off seemed better - an overflow would fail
+     * visibly instead of silently resetting the losers - but that reasoning
+     * missed keep-alive: browsers hold connections open, and with no eviction an
+     * idle handful of them exhausts the pool permanently and the panel becomes
+     * completely unreachable (ping still works, HTTP answers nothing) until the
+     * clients disconnect. That is far worse than one panel rendering empty.
+     *
+     * Page loads also serialise their requests, so the pool should never fill in
+     * normal use; purging is the safety net for when it does.
+     */
+    cfg.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) != ESP_OK) {
@@ -3017,17 +3300,17 @@ static void start_http_server(void)
         { { .uri = "/resetpass",        .method = HTTP_POST }, reset_pass_handler, true },
         { { .uri = "/api/dohurl",       .method = HTTP_GET }, doh_url_get_handler, true },
         { { .uri = "/setdohurl",        .method = HTTP_POST }, set_doh_url_post_handler, true },
-        { { .uri = "/api/clients",      .method = HTTP_GET }, clients_get_handler, true },
+        { { .uri = "/api/clients",      .method = HTTP_GET }, clients_get_handler, false },
         { { .uri = "/api/radio",        .method = HTTP_GET }, radio_get_handler, true },
         { { .uri = "/setradio",         .method = HTTP_POST }, set_radio_post_handler, true },
-        { { .uri = "/api/leases",       .method = HTTP_GET }, leases_get_handler, true },
-        { { .uri = "/lease/add",        .method = HTTP_POST }, add_lease_post_handler, true },
-        { { .uri = "/lease/del",        .method = HTTP_POST }, del_lease_post_handler, true },
-        { { .uri = "/api/dnsrules",     .method = HTTP_GET }, dnsrules_get_handler, true },
+        { { .uri = "/api/leases",       .method = HTTP_GET }, leases_get_handler, false },
+        { { .uri = "/lease/add",        .method = HTTP_POST }, add_lease_post_handler, false },
+        { { .uri = "/lease/del",        .method = HTTP_POST }, del_lease_post_handler, false },
+        { { .uri = "/api/dnsrules",     .method = HTTP_GET }, dnsrules_get_handler, false },
         { { .uri = "/api/hostname",     .method = HTTP_GET }, hostname_get_handler, true },
         { { .uri = "/sethostname",      .method = HTTP_POST }, set_hostname_post_handler, true },
-        { { .uri = "/dnsrule/set",      .method = HTTP_POST }, set_dnsrule_post_handler, true },
-        { { .uri = "/dnsrule/del",      .method = HTTP_POST }, del_dnsrule_post_handler, true },
+        { { .uri = "/dnsrule/set",      .method = HTTP_POST }, set_dnsrule_post_handler, false },
+        { { .uri = "/dnsrule/del",      .method = HTTP_POST }, del_dnsrule_post_handler, false },
         { { .uri = "/api/dnstest",      .method = HTTP_GET }, dnstest_get_handler, true },
         { { .uri = "/api/portmaps",     .method = HTTP_GET }, portmaps_get_handler, true },
         { { .uri = "/portmap/add",      .method = HTTP_POST }, add_portmap_post_handler, true },
@@ -3040,6 +3323,9 @@ static void start_http_server(void)
         { { .uri = "/acl/del",          .method = HTTP_POST }, acl_del_post_handler, true },
         { { .uri = "/acl/enable",       .method = HTTP_POST }, acl_enable_post_handler, true },
         { { .uri = "/setssid",          .method = HTTP_POST }, set_ssid_post_handler, true },
+        { { .uri = "/api/devices",  .method = HTTP_GET  }, devices_get_handler, false },
+        { { .uri = "/device/set",   .method = HTTP_POST }, set_device_post_handler, true },
+
         { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
         { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },
         { { .uri = "/logout",           .method = HTTP_POST }, logout_post_handler, false },
@@ -3079,6 +3365,7 @@ void app_main(void)
     web_auth_init();
     load_ap_settings();
     ap_acl_init();
+    devices_init();
     load_radio_settings();
 
     bool password_generated = false;
