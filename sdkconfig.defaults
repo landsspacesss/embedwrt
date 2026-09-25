@@ -16,6 +16,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_LWIP_DHCPS=n
 CONFIG_USE_OWN_DHCPS=y
 
+# --- OTA: two app slots (ota_0/ota_1) with boot-time rollback. A freshly OTA'd
+# --- image boots as PENDING_VERIFY; if it crashes before app_main reaches
+# --- esp_ota_mark_app_valid_cancel_rollback() the bootloader reverts to the
+# --- other slot. This is the only thing that recovers a build which is a valid
+# --- image but panics at boot. ---
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # --- mbedTLS: wall clock + root CA bundle, both needed by DNS-over-HTTPS ---
 CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y

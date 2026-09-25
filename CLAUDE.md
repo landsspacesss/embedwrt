@@ -27,9 +27,9 @@ idf.py -p /dev/ttyACM0 monitor            # WARNING: this resets the chip
 building, flashing, and then exercising the running device over HTTP — the panel
 exposes JSON endpoints for every subsystem (`/api/clients`, `/api/leases`,
 `/api/dnsrules`, `/api/portmaps`, `/api/acl`, `/api/apcfg`, `/api/dnstest`,
-`/api/session`, …). `/api/dnstest` is the one to reach for when a resolver
-appears broken: it runs a real query through each configured resolver using the
-same code the relay serves clients with.
+`/api/session`, `/api/version`, …). `/api/dnstest` is the one to reach for when a
+resolver appears broken: it runs a real query through each configured resolver
+using the same code the relay serves clients with.
 
 The device is reachable three ways, which is convenient for testing:
 `http://192.168.0.110/` from the upstream LAN, `http://192.168.4.1/` from a client
@@ -40,11 +40,53 @@ from DHCP and *changes*; find it by MAC `a4:cb:8f:c6:7b:ac` rather than assuming
 editing it, delete `sdkconfig` and rebuild, otherwise the regenerated config keeps
 the old values.
 
+### Updating over the network
+
+Once the OTA partition table is in place, `idf.py flash` is only needed for the
+first install. After that the admin panel's Settings tab uploads
+`build/embedwrt.bin`. **That file, not the merged full-flash image** — OTA writes
+one app slot, so the merged image cannot be used. The handler validates the
+uploaded image's `project_name` and rejects anything not built from this project
+(including the bootloader and other projects' apps), which is what stops a
+wrong-but-valid image from being installed and only failing at the next boot.
+
+Two consequences worth knowing before you change the partition table:
+
+- **A partition-table change needs one wired flash.** The app moves, and the
+  bootloader will not find it otherwise.
+- **Keep `nvs` at `0x9000`/`0x6000`.** That offset is what makes the wired flash
+  preserve the panel password, leases, DNS rules, port forwards, ACL and device
+  records; NVS is not erased by `idf.py flash`. Moving it silently wipes the lot.
+
+### Partitions, and why there is no factory slot
+
+`partitions.csv` is `nvs` / `otadata` / `phy_init` / `ota_0` / `ota_1`, two 4 MB
+app slots and no factory. With a blank otadata and no factory the bootloader
+falls back to the first OTA slot and writes otadata itself, so the first wired
+flash after a partition-table change boots `ota_0` with no extra step — that is
+`bootloader_utility_load_boot_image` walking forwards from `start_index + 1`.
+
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is on, and it is the only mechanism
+that recovers a build which is a *valid image* but dies at boot. An OTA'd image
+starts as `PENDING_VERIFY`; if the device resets before
+`esp_ota_mark_app_valid_cancel_rollback()` runs, the next boot marks it `ABORTED`
+and boots the other slot. That call sits at the very end of `app_main()`, right
+after `start_http_server()` and `start_mdns()` — late enough that "WiFi, DNS and
+the panel all came up" is the test, early enough that the window in which a
+restart could be mistaken for a failed boot is about two seconds. It returns an
+error on a wired flash or an already-confirmed OTA, which is expected and
+ignored.
+
+**Do not add an early `esp_restart()` or `abort()` to `app_main` to test
+something** — it will roll the device back. If you need a deliberate bad image
+for a rollback test, build it, OTA it, and remove it; recovery from a device stuck
+in a boot loop is a wired flash.
+
 ## The web page is generated — do not hand-edit it
 
-`html_page` in `main/my_wifi_router.c` is ~2900 lines of escaped C string
-literals. It is produced from `tools/gen_page.py`, which holds the document
-naturally and emits the literals:
+`html_page` in `main/my_wifi_router.c` is ~1200 lines of escaped C string
+literals (~75 KB of HTML). It is produced from `tools/gen_page.py`, which holds
+the document naturally and emits the literals:
 
 ```sh
 python3 tools/gen_page.py main/my_wifi_router.c
@@ -78,8 +120,10 @@ translation key). Recovery that worked: **restore the file from git and re-apply
 the edits one at a time, checking a list of expected function names after each
 step** — not patching the damaged copy. Two habits: pick the splice end as *the
 next top-level `function` definition*, never a comment that could appear anywhere;
-and sanity-check the served size (~55 KB). A drop of tens of KB means something
-was deleted.
+and sanity-check the output size — the generator prints the translated byte count
+(`spliced: N bytes of HTML`) and `main/page_as_served.js` was ~62 KB when this was
+written. A drop of tens of KB means something was deleted. Run the generator
+before and after a change to compare, rather than trusting a remembered number.
 
 ## Where the pieces live
 
@@ -192,8 +236,10 @@ connection was refused, and a browser holding a few keep-alive sockets made the
 panel unreachable entirely (ping fine, HTTP dead). Two consequences:
 
 - Page loads run their requests **sequentially**, so the count stays at one
-  however many panel sections exist. Adding a section means adding it to that
-  chain.
+  however many panel sections exist. Adding a section means adding its loader to
+  the chain: `loadSettings()` for anything in the Settings tab, and `fetchSeq()`
+  in `loadClients()`/`loadGuestView()` elsewhere. A loader that fires its own
+  parallel `fetch` is what breaks this.
 - `lru_purge_enable` must stay **on**. Turning it off looks better (fail visibly
   rather than silently resetting the loser) but with no eviction idle keep-alive
   connections exhaust the pool permanently.
@@ -218,6 +264,14 @@ reach it. Most routes are admin-only; the guest-reachable ones are exactly `/`,
 deliberately *not* admin-only at the route level: they would otherwise return 401
 before the per-device guard could decide, and a guest could never edit its own
 device. They rely on `caller_may_touch()` instead, which fails closed.
+
+**Answering a request whose body is still unread desynchronises the connection.**
+The client sees the status line but not the body, so a rejection arrives as a
+bare `500` with no explanation. This bit the OTA handler: `esp_ota_write()`
+validates the image magic byte on the *first* chunk, so a non-firmware upload was
+aborted with most of the body still unread, and the reason never reached the
+browser. `ota_drain()` discards the remainder before responding. Any handler that
+can fail part way through a large body needs the same treatment.
 
 **Reaching the panel over the network from the dev host:** the panel password
 lives in NVS, and there is no in-band recovery if it is forgotten. Clearing it
@@ -252,16 +306,32 @@ as `http://`.
 
 `master` holds the working repeater plus every feature: static leases, port
 forwarding, per-device DNS (DoH/DoT/plain), the client list, AP controls, mDNS,
-sessions with an admin/guest role split, and MAC-keyed IoT ownership with the two
-claim policies above.
+sessions with an admin/guest role split, MAC-keyed IoT ownership with the two
+claim policies above, and firmware update from the panel.
 
 **Verified on hardware:** NAT forwarding (11.87 Mbps at close range, measured
 server-side), DHCP including the awkward static-lease path, per-device DNS routing,
-the client list with AP-side RSSI, mDNS resolution, the login/logout cycle, and the
-socket-pool and address-resolution fixes.
+the client list with AP-side RSSI, mDNS resolution, the login/logout cycle, the
+socket-pool and address-resolution fixes, and the guest view (its own device
+listed, an unowned IoT device claimable, the claim written to NVS and surviving a
+reboot).
 
-**Not verified:** the guest path end to end — claiming a device, releasing it, and
-editing its own lease and DNS from a device on the AP. Every piece is in place and
-the HTTP-level refusals are tested, but the positive path needs a browser on the
-AP, which had not happened when this was written. Treat "guest mode works" as
-unproven until that is exercised.
+**Verified on hardware, OTA:** a wired flash of the two-slot table booted `ota_0`
+with no manual otadata step; every NVS-backed setting survived that reflash and
+four subsequent OTA cycles byte-for-byte; uploads alternated `ota_0` / `ota_1`
+with `/api/version` reporting the new slot; the bootloader rolled back to the
+previous slot after an image that restarted before marking itself valid. Negative
+cases all rejected without disturbing the running firmware: a text file, an
+oversized body (over 4 MB), the bootloader, and a valid app image built from a
+differently-named project.
+
+**Not verified:** the guest path for *editing* — a guest changing its own lease or
+DNS, and releasing a device it holds — has been exercised over HTTP but not
+through a browser on the AP since the guest view was reworked into collapsible
+cards.
+
+**Known limits of the update path:** a panel session lives in RAM, so an OTA
+restart logs the administrator out; that is expected and the UI says so. The
+upload is HTTP, so the image crosses the LAN in the clear. Rollback covers a build
+that crashes at boot, not one that boots but misbehaves — fix the latter by
+uploading a good image, the panel is still up.

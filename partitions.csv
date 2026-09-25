@@ -1,5 +1,18 @@
 # Name,   Type, SubType, Offset,   Size,  Flags
-# 16 MB flash (ESP32-S3 N16R8): 4 MB app to leave room for TLS + DoH + web UI.
+# 16 MB flash (ESP32-S3 N16R8). Two 4 MB OTA slots so the panel can flash the
+# device over the network; ~7.9 MB stays unused after ota_1.
+#
+# The nvs offset and size are deliberately unchanged from the single-factory
+# layout this replaced. Keeping them is what lets a reflash of the new table
+# preserve the panel password, leases, DNS rules, port forwards, ACL and device
+# records - NVS is never erased by idf.py flash.
+#
+# There is no factory partition: with a blank otadata the IDF bootloader falls
+# back to the first OTA slot and writes otadata itself (see
+# bootloader_utility_load_boot_image / set_actual_ota_seq), so the first wired
+# flash after this change boots ota_0 with no extra step.
 nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  4M,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  4M,
+ota_1,    app,  ota_1,   0x420000, 4M,

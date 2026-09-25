@@ -18,6 +18,7 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "mdns.h"
@@ -33,6 +34,8 @@
 #include "esp_wifi.h"
 #include "esp_mac.h"
 #include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "cJSON.h"
 
 #include "ap_dhcp.h"
@@ -794,8 +797,7 @@ static const char *html_page =
 "    <div class='subtitle' data-i18n='subtitle'>WiFi NAT router &middot; DoH / DoT</div>"
 "  </div>"
 "  <div id='guest-view'>"
-"    <h1 data-i18n='guest_title'>Limited access</h1>"
-"    <div class='hint' style='margin:10px 0 14px' data-i18n='guest_body'></div>"
+"    <div class='hint' id='guest-body' style='margin:0 0 14px' data-i18n='guest_body'></div>"
 "    <div id='guest-ident' class='hint'></div>"
 "    <div id='guest-devices'></div>"
 "    <button class='btn' style='margin-top:14px' onclick='showLogin()' data-i18n='login_btn'>Log in</button>"
@@ -910,6 +912,16 @@ static const char *html_page =
 "      <div class='hint' style='margin:6px 0 0' data-i18n='clear_visit_hint'></div></div>"
 "    <button class='btn' onclick='saveDevPolicy()' data-i18n='save_btn'>SAVE</button>"
 ""
+"    <h2 data-i18n='sec_fw'>Firmware update</h2>"
+"    <div class='hint' style='margin:0 0 10px'><span data-i18n='fw_current'></span>"
+"      <b id='fw-version'>-</b> <span class='mono' id='fw-slot'></span></div>"
+"    <div class='form-group'><label data-i18n='fw_file'></label><input type='file' id='fw-file' accept='.bin'></div>"
+"    <progress id='fw-bar' max='100' value='0' style='display:none;width:100%;height:8px'></progress>"
+"    <button class='btn danger' id='fw-btn' onclick='otaUpload()' data-i18n='fw_upload_btn'>UPLOAD AND RESTART</button>"
+"    <div class='hint' style='margin:8px 0 0' data-i18n='fw_hint'></div>"
+"    <div class='hint' style='margin:8px 0 0' data-i18n='fw_ap_note'></div>"
+"    <div id='fw-msg' class='hint' style='margin-top:8px'></div>"
+""
 "    <h2 data-i18n='sec_about'>About</h2>"
 "    <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>"
 "    <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>"
@@ -966,11 +978,19 @@ static const char *html_page =
 " acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',"
 " sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
 " loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',claim_btn:'Claim',release_btn:'Release',sec_policy:'Device ownership',guest_claim_label:'Allow visitors to claim unowned IoT devices',guest_claim_hint:'A visitor can take an unowned IoT device without logging in, and release it again. Only unowned ones, so one visitor cannot take a device another already manages.',clear_visit_label:'Drop the IoT flag when that device opens the panel',clear_visit_hint:'Anything able to open a web UI is not a dumb IoT device. Only affects the device that visits.',claimable_hint:'Unowned - a visitor may claim this.',your_device:'Your device',guest_devices:'Devices you can manage',device_offline:'offline',"
+" sec_fw:'Firmware update',fw_current:'Installed version',fw_slot:'slot',fw_file:'Firmware file (.bin)',"
+" fw_hint:'Upload build/embedwrt.bin - the application image. The merged full-flash image will not work here.',"
+" fw_upload_btn:'UPLOAD AND RESTART',"
+" fw_confirm:'Write this firmware to the device? It will restart and every client will drop.',"
+" fw_uploading:'Uploading',fw_ok:'Firmware written. The device is restarting.',"
+" fw_wait:'Waiting for the device to come back',fw_relogin:'The device restarted. Log in again to check the new version.',"
+" fw_failed:'Update failed',fw_nofile:'Choose a firmware file first',"
+" fw_noback:'The device did not come back. Reload this page to check.',"
+" fw_ap_note:'The upload takes a minute over WiFi, and DNS and forwarding will stutter while it writes. The access point stays up until the restart.',"
 " login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',"
 " login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',"
 " login_failed:'Wrong user or password',login_ok:'Signed in',"
-" guest_title:'Limited access',"
-" guest_body:'You are not signed in. This device only shows its own settings to a visitor; everything else needs an administrator login.',"
+" guest_body:'Signed out. You can manage this device below, or log in as administrator.',"
 " guest_you:'Your address',"
 " guest_noident:'This address does not belong to a device on this network, so there is nothing to show. Log in as administrator for full access.',"
 " session_open:'No admin password is set, so the panel is open to anyone who can reach it.',lease_for:'Static lease for this device',dns_for:'DNS for this device',save_btn:'SAVE',remove_btn:'REMOVE',set_mark:'set',not_set:'not set',use_default_dns:'(none - uses the default resolver)',no_rules:'No rules',no_leases:'No static leases',no_forwards:'No rules',no_networks:'No networks',scan_failed:'Scan failed',failed_load:'Failed to load',"
@@ -1021,11 +1041,19 @@ static const char *html_page =
 " acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',"
 " sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
 " loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',claim_btn:'认领',release_btn:'放弃',sec_policy:'设备归属',guest_claim_label:'允许访客认领无主的物联网设备',guest_claim_hint:'访客无需登录即可认领无主的物联网设备，也可以放弃。只限无主的，所以不会抢走别人已在管理的设备。',clear_visit_label:'该设备打开面板时自动取消其物联网标记',clear_visit_hint:'能自己打开网页的就不算哑设备。只影响访问面板的那台设备本身。',claimable_hint:'无主 - 访客可以认领。',your_device:'你的设备',guest_devices:'你可以管理的设备',device_offline:'离线',"
+" sec_fw:'固件更新',fw_current:'当前固件：',fw_slot:'槽位',fw_file:'固件文件（.bin）',"
+" fw_hint:'请上传 build/embedwrt.bin，即应用程序镜像。合并后的整片烧录镜像不能用于此处。',"
+" fw_upload_btn:'上传并重启',"
+" fw_confirm:'确定把该固件写入设备？设备会重启，所有客户端都会断开。',"
+" fw_uploading:'上传中',fw_ok:'固件已写入，设备正在重启。',"
+" fw_wait:'等待设备重新上线',fw_relogin:'设备已重启。请重新登录以确认新版本。',"
+" fw_failed:'更新失败',fw_nofile:'请先选择固件文件',"
+" fw_noback:'设备没有回应。请刷新本页查看。',"
+" fw_ap_note:'通过 WiFi 上传约需一分钟，写入期间 DNS 和转发会短暂卡顿。热点会保持到重启那一刻。',"
 " login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',"
 " login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',"
 " login_failed:'用户名或密码错误',login_ok:'已登录',"
-" guest_title:'受限访问',"
-" guest_body:'你尚未登录。访客只能看到自己那台设备的设置，其余功能需要管理员登录。',"
+" guest_body:'未登录。可在下方管理本机设备，或以管理员身份登录。',"
 " guest_you:'你的地址',"
 " guest_noident:'这个地址不属于本网络上的设备，因此没有可显示的内容。以管理员身份登录可获得完整权限。',"
 " session_open:'未设置管理员密码，能访问到本面板的人都可以操作。',lease_for:'该设备的静态租约',dns_for:'该设备的 DNS',save_btn:'保存',remove_btn:'移除',set_mark:'已设置',not_set:'未设置',use_default_dns:'（未设置 - 使用默认解析器）',no_rules:'暂无规则',no_leases:'暂无静态租约',no_forwards:'暂无规则',no_networks:'未发现网络',scan_failed:'扫描失败',failed_load:'加载失败',"
@@ -1116,7 +1144,7 @@ static const char *html_page =
 "}"
 "function loadSettings(gen){"
 "  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,loadDevPolicy,"
-"                        loadLeases,loadDnsRules,loadPortmaps,loadHostname],gen);"
+"                        loadLeases,loadDnsRules,loadPortmaps,loadHostname,loadFwInfo],gen);"
 "}"
 "function init(){"
 "  fetch('/status').then(function(r){return r.json()}).then(function(d){"
@@ -1299,7 +1327,7 @@ static const char *html_page =
 "   claiming is enabled - unowned IoT devices it could take. Driven by /api/devices"
 "   (which knows the claim flags and includes offline devices) unioned with"
 "   /api/clients (which has the live hostname and address). */"
-"function loadGuestView(){"
+"function loadGuestView(msg){"
 "  var box=document.getElementById('guest-devices');"
 "  box.innerHTML='<div class=\"loading\">'+t('loading')+'</div>';"
 "  fetchSeq(['/api/devices','/api/clients','/api/leases','/api/dnsrules']).then(function(res){"
@@ -1309,33 +1337,58 @@ static const char *html_page =
 "    var live={};C.forEach(function(c){live[c.mac]=c});"
 "    var seen={},order=[];"
 "    function add(m){if(m&&!seen[m]){seen[m]=1;order.push(m)}}"
+"    /* This device first: it is the one the visitor came to configure. */"
+"    add(me);"
 "    (D.devices||[]).forEach(function(d){add(d.mac)});"
 "    C.forEach(function(c){add(c.mac)});"
+"    var gb=document.getElementById('guest-body');"
 "    if(!order.length){"
+"      /* No identity, so there is nothing below to manage. Hide the line that"
+"         offers to manage it, or the two hints contradict each other. */"
+"      if(gb){gb.style.display='none'}"
 "      box.innerHTML='<div class=\"hint\">'+t('guest_noident')+'</div>';"
 "      return;"
 "    }"
+"    if(gb){gb.style.display='block'}"
 "    var h=\"<h2>\"+t('guest_devices')+\"</h2>\";"
 "    order.forEach(function(mac){"
 "      var id=mac.replace(/:/g,'');"
 "      var d=rec[mac]||{};"
 "      var c=live[mac];"
 "      var isSelf=(mac===me);"
-"      var editable=!!d.mine;              /* the server applies the same rule */"
+"      /* A device always may edit itself. It has no record in /api/devices"
+"         unless it is flagged or owned, so d.mine alone leaves a plain guest"
+"         looking at its own card with no form. The write guards agree: a caller"
+"         may touch its own MAC. */"
+"      var editable=isSelf||!!d.mine;"
 "      var claimable=!!d.claimable;"
 "      var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});"
 "      var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});"
 "      var head=(c&&c.host)?c.host:t('unknown');"
 "      h+=\"<div style='border:1px solid #e2e8f0;border-radius:8px;margin-bottom:12px;overflow:hidden'>\";"
-"      h+=\"<div style='padding:10px 14px;background:#f8fafc'>\";"
-"      h+=\"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px'>\""
-"        +\"<span class='mono' style='font-size:12px'>\"+mac+\"</span>\""
-"        +\"<span style='font-size:12px;color:\"+(c?'#15803d':'#94a3b8')+\"'>\""
-"        +(c?(c.ip||'?'):t('device_offline'))+\"</span></div>\";"
-"      h+=\"<div style='font-size:12px;color:#475569;margin-top:3px'>\"+head"
-"        +(isSelf?(' &middot; <b>'+t('your_device')+'</b>'):'')+\"</div>\";"
+"      h+=\"<div style='padding:10px 14px;background:#f8fafc;display:flex;align-items:center;gap:8px'>\";"
+"      h+=\"<div style='flex:1;min-width:0'>\""
+"        +\"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px'>\""
+"        +\"<span class='mono' style='font-size:12px;overflow:hidden;text-overflow:ellipsis'>\"+mac+\"</span>\""
+"        +\"<span style='font-size:12px;white-space:nowrap;color:\"+(c?'#15803d':'#94a3b8')+\"'>\""
+"        +(c?(c.ip||'?'):t('device_offline'))+\"</span></div>\""
+"        +\"<div style='font-size:12px;color:#475569;margin-top:3px;overflow:hidden;text-overflow:ellipsis'>\"+head"
+"        +(isSelf?(' &middot; <b>'+t('your_device')+'</b>'):'')"
+"        +(claimable?(' &middot; '+t('claimable_hint')):'')+\"</div>\""
+"        +\"</div>\";"
+"      if(editable){"
+"        h+=\"<button class='refresh-btn' style='flex:0 0 auto' onclick='toggleGuest(\\\"\"+id+\"\\\")'>&#9881; \"+t('cfg_btn')+\"</button>\";"
+"      }else if(claimable){"
+"        /* Claiming is one action, so it gets a button rather than a card. */"
+"        h+=\"<button class='refresh-btn' style='flex:0 0 auto' onclick='aclClaim(\\\"\"+mac+\"\\\")'>\"+t('claim_btn')+\"</button>\";"
+"      }"
 "      h+=\"</div>\";"
 "      if(editable){"
+"        /* The card is a SIBLING of the bar, not its child: nested inside a"
+"           clickable bar, a click on a card button bubbles up and toggles the"
+"           card shut. The admin client row is built this way for the same"
+"           reason. */"
+"        h+=\"<div id='cd-\"+id+\"' style='display:none'>\";"
 "        h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');"
 "        /* An owned IoT device: its holder may hand it back. */"
 "        if(d.iot&&d.owner===me&&!isSelf){"
@@ -1343,12 +1396,7 @@ static const char *html_page =
 "            +\"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\\\"\"+mac+\"\\\")'>\""
 "            +t('release_btn')+\"</button></div>\";"
 "        }"
-"      }else if(claimable){"
-"        /* Not ours to edit, but shown so it can be claimed. */"
-"        h+=\"<div style='padding:12px 14px;background:#f8fafc'>\""
-"          +\"<div class='hint' style='margin:0 0 8px'>\"+t('claimable_hint')+\"</div>\""
-"          +\"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\\\"\"+mac+\"\\\")'>\""
-"          +t('claim_btn')+\"</button></div>\";"
+"        h+=\"</div>\";"
 "      }"
 "      h+=\"</div>\";"
 "    });"
@@ -1359,7 +1407,36 @@ static const char *html_page =
 "      if(ms){wirePresets(ms,document.getElementById('cd-preset-'+id),"
 "                         document.getElementById('cd-addr-'+id))}"
 "    });"
+"    /* Re-open and reload whichever card was expanded before, so a save does not"
+"       silently collapse it and hide the result message. */"
+"    if(openGuestId){"
+"      var el=document.getElementById('cd-'+openGuestId);"
+"      if(el){"
+"        el.style.display='block';"
+"        if(msg){cdMsg(openGuestId,msg.ok,msg.txt)}"
+"      }else{"
+"        openGuestId=null;"
+"      }"
+"    }"
 "  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"var openGuestId=null;"
+"function toggleGuest(id){"
+"  var el=document.getElementById('cd-'+id);"
+"  if(!el){return}"
+"  if(el.style.display==='block'){openGuestId=null;el.style.display='none';return}"
+"  openGuestId=id;"
+"  el.style.display='block';"
+"}"
+"/* A device card is drawn in two places - the admin Clients tab and the guest"
+"   view. A save has to re-render whichever one is on screen; refreshing the other"
+"   writes the result into hidden DOM and the user sees nothing at all. */"
+"function isGuestView(){"
+"  return document.getElementById('guest-view').style.display!=='none';"
+"}"
+"function refreshDeviceView(id,msg){"
+"  if(isGuestView()){openGuestId=id;loadGuestView(msg);return}"
+"  openClientId=id;keepMsg=msg;loadClients();"
 "}"
 "function cdMsg(id,ok,txt){"
 "  var m=document.getElementById('cd-msg-'+id);"
@@ -1370,15 +1447,14 @@ static const char *html_page =
 "  if(!ip){keepMsg={ok:false,txt:t('enter_both')};cdMsg(id,false,t('enter_both'));return}"
 "  fetch('/lease/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&ip='+encodeURIComponent(ip)})"
 "  .then(function(r){return r.text().then(function(x){"
-"    openClientId=id; keepMsg={ok:r.ok,txt:x};"
-"    loadClients();          /* re-render, which reopens the card and shows x */"
+"    refreshDeviceView(id,{ok:r.ok,txt:x});   /* reopens the card and shows x */"
 "    loadLeases();"
 "  })});"
 "}"
 "function cdDelLease(mac,id){"
 "  if(!confirm(t('confirm_lease')+' '+mac+' ?')){return}"
 "  fetch('/lease/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
-"  .then(function(){loadClientDetail(document.getElementById('cd-'+id),id);loadLeases()});"
+"  .then(function(){refreshDeviceView(id);loadLeases()});"
 "}"
 "function cdSaveRule(mac,id){"
 "  var mode=document.getElementById('cd-mode-'+id).value;"
@@ -1386,15 +1462,14 @@ static const char *html_page =
 "  if(!addr){keepMsg={ok:false,txt:t('enter_both')};cdMsg(id,false,t('enter_both'));return}"
 "  fetch('/dnsrule/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&mode='+mode+'&addr='+encodeURIComponent(addr)})"
 "  .then(function(r){return r.text().then(function(x){"
-"    openClientId=id; keepMsg={ok:r.ok,txt:x};"
-"    loadClients();"
+"    refreshDeviceView(id,{ok:r.ok,txt:x});"
 "    loadDnsRules();"
 "  })});"
 "}"
 "function cdDelRule(mac,id){"
 "  if(!confirm(t('confirm_rule')+' '+mac+' ?')){return}"
 "  fetch('/dnsrule/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
-"  .then(function(){loadClientDetail(document.getElementById('cd-'+id),id);loadDnsRules()});"
+"  .then(function(){refreshDeviceView(id);loadDnsRules()});"
 "}"
 "function loadSsid(){return fetch('/api/ssid').then(function(r){return r.json()}).then(function(d){document.getElementById('ssid-name').value=d.ssid}).catch(function(){})}"
 "function saveSsid(){"
@@ -1644,11 +1719,16 @@ static const char *html_page =
 "  .catch(function(){ m.innerHTML=t('failed') });"
 "}"
 "function aclClaim(mac){"
+"  var id=mac.replace(/:/g,'');"
 "  fetch('/claim',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
 "        body:'mac='+encodeURIComponent(mac)})"
 "  .then(function(r){ return r.text().then(function(x){"
 "    if(!r.ok){ alert(t('rejected')+': '+x) }"
-"    loadGuestView();"
+"    /* Claiming makes the device editable, so open its card and say so. A"
+"       release leaves it claimable with no card, where there is nowhere to put"
+"       the message - the row changing back is the feedback. */"
+"    openGuestId=id;"
+"    loadGuestView(r.ok?{ok:true,txt:t('saved')}:null);"
 "  }) });"
 "}"
 "function loadAcl(){"
@@ -1700,6 +1780,81 @@ static const char *html_page =
 "  fetch('/sethostname',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hostname='+encodeURIComponent(v)})"
 "  .then(function(r){return r.text().then(function(x){document.getElementById('settings-msg').innerHTML=r.ok?t('saved'):(t('rejected')+': '+x)})})"
 "  .finally(function(){btn.innerText=t('save_mdns_btn')});"
+"}"
+"/* Installed build, and which OTA slot it is running from. The slot is what tells"
+"   you an upload actually switched slots rather than silently doing nothing. */"
+"function loadFwInfo(){"
+"  return fetch('/api/version').then(function(r){return r.json()}).then(function(d){"
+"    var v=document.getElementById('fw-version');"
+"    if(v){v.textContent=(d.project||'?')+' '+(d.version||'?')+' ('+(d.date||'?')+' '+(d.time||'?')+')'}"
+"    var s=document.getElementById('fw-slot');"
+"    if(s){s.textContent=(d.slot?t('fw_slot')+' '+d.slot:'')}"
+"  }).catch(function(){});"
+"}"
+"/* Waits out the restart, then reports. The delay before the first poll matters:"
+"   the response to the upload arrives while the OLD firmware is still running and"
+"   answering normally, so polling straight away would succeed against the old"
+"   build and reload the page too early. */"
+"function waitForReboot(){"
+"  var m=document.getElementById('fw-msg');"
+"  var tries=0;"
+"  function poll(){"
+"    tries++;"
+"    fetch('/api/session',{cache:'no-store'}).then(function(r){"
+"      if(r.ok){ m.innerHTML='<span style=\"color:#15803d\">'+t('fw_relogin')+'</span>';"
+"                setTimeout(function(){location.reload()},1500); return }"
+"      retry();"
+"    }).catch(retry);"
+"  }"
+"  function retry(){"
+"    if(tries>20){ m.innerHTML='<span style=\"color:#b45309\">'+t('fw_noback')+'</span>'; return }"
+"    setTimeout(poll,2000);"
+"  }"
+"  m.innerHTML=t('fw_wait');"
+"  setTimeout(poll,8000);"
+"}"
+"function otaUpload(){"
+"  var inp=document.getElementById('fw-file');"
+"  var m=document.getElementById('fw-msg');"
+"  var bar=document.getElementById('fw-bar');"
+"  var btn=document.getElementById('fw-btn');"
+"  if(!inp||!inp.files||!inp.files.length){ m.innerHTML='<span style=\"color:#b45309\">'+t('fw_nofile')+'</span>'; return }"
+"  var f=inp.files[0];"
+"  if(!confirm(t('fw_confirm')+' '+f.name+' ('+Math.round(f.size/1024)+' KB)')){return}"
+"  /* XMLHttpRequest rather than fetch: fetch cannot report upload progress. The"
+"     File object is sent as the raw body, so the device needs no form parsing. */"
+"  var xhr=new XMLHttpRequest();"
+"  xhr.open('POST','/ota');"
+"  xhr.setRequestHeader('Content-Type','application/octet-stream');"
+"  btn.disabled=true;"
+"  btn.innerText=t('fw_uploading');"
+"  bar.style.display='block';"
+"  bar.value=0;"
+"  xhr.upload.onprogress=function(e){"
+"    if(e.lengthComputable){"
+"      var pct=Math.round(e.loaded*100/e.total);"
+"      bar.value=pct;"
+"      m.innerHTML=t('fw_uploading')+' '+pct+'%';"
+"    }"
+"  };"
+"  xhr.onload=function(){"
+"    if(xhr.status>=200&&xhr.status<300){"
+"      bar.value=100;"
+"      m.innerHTML='<span style=\"color:#15803d\">'+t('fw_ok')+'</span>';"
+"      waitForReboot();"
+"    }else{"
+"      btn.disabled=false;"
+"      btn.innerText=t('fw_upload_btn');"
+"      bar.style.display='none';"
+"      /* textContent, not innerHTML: this is whatever the device sent back. */"
+"      m.innerHTML='<span style=\"color:#b91c1c\">'+t('fw_failed')+': </span>';"
+"      m.appendChild(document.createTextNode(xhr.responseText||''));"
+"    }"
+"  };"
+"  /* A network error here usually means the device restarted before it could"
+"     reply, which is a success - so follow the same wait path. */"
+"  xhr.onerror=function(){ waitForReboot() };"
+"  xhr.send(f);"
 "}"
 "function changePass(){"
 "  var pass=document.getElementById('new-pass').value;"
@@ -2644,6 +2799,214 @@ static esp_err_t set_device_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ======================= firmware update ======================= */
+
+/* Plain text, fixed strings only. httpd_resp_send_err wraps its message in an
+ * HTML page, which the upload script would then render into the settings panel;
+ * a short text body reads better there and cannot carry anything injected. */
+static esp_err_t ota_fail(httpd_req_t *req, const char *status, const char *msg)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+}
+
+/*
+ * Discard the rest of the request body before answering.
+ *
+ * Answering while body bytes are still unread desynchronises the connection:
+ * the status line reaches the client but the body does not, so a rejected
+ * upload shows up as a bare 500 with no explanation. This was a real bug - an
+ * upload caught on its first chunk (esp_ota_write validates the image magic
+ * byte immediately) left most of the body unread and the reason never arrived.
+ */
+static void ota_drain(httpd_req_t *req, int remaining)
+{
+    char sink[256];
+    while (remaining > 0) {
+        int want = (remaining < (int)sizeof(sink)) ? remaining : (int)sizeof(sink);
+        int got = httpd_req_recv(req, sink, want);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (got <= 0) {
+            return;   /* client went away; nothing left to drain */
+        }
+        remaining -= got;
+    }
+}
+
+static void ota_reboot_cb(void *arg)
+{
+    esp_restart();
+}
+
+/*
+ * Accepts the app image as a raw request body (not multipart), so there is no
+ * form parsing: the browser sends the File object itself and we stream it
+ * straight into the inactive slot.
+ *
+ * The boot partition is switched only after esp_ota_end() accepts the image, so
+ * a truncated upload, a corrupt image or a failed write leaves the running
+ * firmware untouched - there is no half-written-image brick.
+ */
+#define OTA_CHUNK 4096
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0) {
+        return ota_fail(req, "400 Bad Request", "empty body");
+    }
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (part == NULL) {
+        ESP_LOGE(TAG_MAIN, "no OTA slot to write to");
+        ota_drain(req, req->content_len);
+        return ota_fail(req, "500 Internal Server Error", "no OTA partition");
+    }
+    if ((size_t)req->content_len > part->size) {
+        ESP_LOGE(TAG_MAIN, "OTA: %d bytes does not fit %s (%u bytes)",
+                 (int)req->content_len, part->label, (unsigned)part->size);
+        ota_drain(req, req->content_len);
+        return ota_fail(req, "400 Bad Request", "image is larger than the OTA slot");
+    }
+
+    ESP_LOGW(TAG_MAIN, "OTA: writing %d bytes to %s",
+             (int)req->content_len, part->label);
+
+    /* Pass the real length rather than OTA_SIZE_UNKNOWN: it erases only the
+     * sectors the image needs instead of the whole 4 MB slot. */
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = esp_ota_begin(part, (size_t)req->content_len, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "esp_ota_begin: %s", esp_err_to_name(err));
+        ota_drain(req, req->content_len);
+        return ota_fail(req, "500 Internal Server Error", "cannot start the update");
+    }
+
+    /* Internal RAM on purpose. esp_ota_write runs with the flash cache off, and
+     * on this chip PSRAM is only reachable through that cache. */
+    char *buf = heap_caps_malloc(OTA_CHUNK, MALLOC_CAP_INTERNAL);
+    if (buf == NULL) {
+        esp_ota_abort(handle);
+        ota_drain(req, req->content_len);
+        return ota_fail(req, "500 Internal Server Error", "out of memory");
+    }
+
+    int remaining = req->content_len;
+    int total = 0;
+    const char *why = NULL;
+    esp_err_t write_err = ESP_OK;
+
+    while (remaining > 0) {
+        int want = (remaining < OTA_CHUNK) ? remaining : OTA_CHUNK;
+        int got = httpd_req_recv(req, buf, want);
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) {
+            /* A WiFi hiccup, not a reason to throw the upload away. */
+            continue;
+        }
+        if (got <= 0) {
+            why = "connection lost during upload";
+            break;
+        }
+        err = esp_ota_write(handle, buf, got);
+        if (err != ESP_OK) {
+            /* esp_ota_write validates the image as it goes: a body that is not
+             * an app image at all is refused on the first chunk, with the magic
+             * byte named in the log. */
+            ESP_LOGE(TAG_MAIN, "esp_ota_write: %s", esp_err_to_name(err));
+            write_err = err;
+            why = "flash write failed";
+            break;
+        }
+        remaining -= got;
+        total += got;
+    }
+    free(buf);
+
+    if (why != NULL) {
+        esp_ota_abort(handle);
+        /* remaining > 0 here: the loop stopped part way through the body. */
+        ota_drain(req, remaining);
+        ESP_LOGE(TAG_MAIN, "OTA aborted after %d bytes: %s (%s)",
+                 total, why, esp_err_to_name(write_err));
+        if (write_err == ESP_ERR_OTA_VALIDATE_FAILED ||
+                write_err == ESP_ERR_INVALID_ARG) {
+            return ota_fail(req, "400 Bad Request", "not a valid firmware image");
+        }
+        return ota_fail(req, "500 Internal Server Error", why);
+    }
+
+    if ((err = esp_ota_end(handle)) != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "esp_ota_end: %s", esp_err_to_name(err));
+        return ota_fail(req, "400 Bad Request", "not a valid firmware image");
+    }
+
+    /* esp_ota_end checks that the image is well formed, not that it is ours.
+     * Without this, uploading the bootloader or another project's build is
+     * accepted here and only fails at the next boot. */
+    esp_app_desc_t desc;
+    memset(&desc, 0, sizeof(desc));
+    if (esp_ota_get_partition_description(part, &desc) != ESP_OK) {
+        return ota_fail(req, "400 Bad Request", "image carries no app descriptor");
+    }
+    if (strcmp(desc.project_name, "embedwrt") != 0) {
+        /* Logged, not echoed: the name comes from whatever was uploaded. */
+        ESP_LOGE(TAG_MAIN, "OTA rejected: image is for project '%s', not 'embedwrt'",
+                 desc.project_name);
+        return ota_fail(req, "400 Bad Request", "image is for a different project");
+    }
+
+    if ((err = esp_ota_set_boot_partition(part)) != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "esp_ota_set_boot_partition: %s", esp_err_to_name(err));
+        return ota_fail(req, "500 Internal Server Error", "cannot switch boot partition");
+    }
+
+    ESP_LOGW(TAG_MAIN, "OTA: %d bytes into %s, version %s; restarting in 2s",
+             total, part->label, desc.version);
+    httpd_resp_sendstr(req, "OK");
+
+    /* Reboot only once the response is on the wire. Restarting first makes the
+     * browser report a network error, and the user cannot tell success from
+     * failure. */
+    esp_timer_create_args_t args = {0};
+    args.callback = ota_reboot_cb;
+    args.name = "ota_reboot";
+    esp_timer_handle_t timer = NULL;
+    if (esp_timer_create(&args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, 2 * 1000 * 1000);
+    } else {
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
+/* Which build is installed, and which slot it is running from. The slot label
+ * is the point: it is how you confirm an update actually switched slots. */
+static esp_err_t version_get_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *d = esp_app_get_description();
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "version", d ? d->version : "");
+    cJSON_AddStringToObject(root, "project", d ? d->project_name : "");
+    cJSON_AddStringToObject(root, "date",    d ? d->date : "");
+    cJSON_AddStringToObject(root, "time",    d ? d->time : "");
+    cJSON_AddStringToObject(root, "idf",     d ? d->idf_ver : "");
+    cJSON_AddStringToObject(root, "slot",    run ? run->label : "");
+    cJSON_AddStringToObject(root, "next",    next ? next->label : "");
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
 static esp_err_t session_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -3495,6 +3858,10 @@ static void start_http_server(void)
         { { .uri = "/claim",        .method = HTTP_POST }, claim_post_handler, false },
         { { .uri = "/setdevpolicy", .method = HTTP_POST }, set_devpolicy_post_handler, true },
 
+        /* Firmware update. Admin-only: this rewrites the boot partition. */
+        { { .uri = "/api/version",  .method = HTTP_GET  }, version_get_handler, true },
+        { { .uri = "/ota",          .method = HTTP_POST }, ota_post_handler, true },
+
         { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
         { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },
         { { .uri = "/logout",           .method = HTTP_POST }, logout_post_handler, false },
@@ -3658,4 +4025,15 @@ void app_main(void)
     start_sntp();
     start_http_server();
     start_mdns();
+
+    /* Reaching here means the image boots far enough to bring up WiFi, the DNS
+     * relay and the panel, so it counts as good and a boot-time rollback is
+     * cancelled. Doing it this early keeps the window in which a reset would be
+     * mistaken for a failed boot down to a couple of seconds. It returns an
+     * error when the running image is not pending verification (a wired flash,
+     * or an already-confirmed OTA), which is not a problem. */
+    esp_err_t roll = esp_ota_mark_app_valid_cancel_rollback();
+    if (roll == ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "OTA image confirmed; rollback cancelled");
+    }
 }
