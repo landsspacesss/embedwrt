@@ -360,11 +360,11 @@ function initPresets(){
               document.getElementById('dr-addr'));
 }
 /* Sequential on purpose. Firing every section's request at once exceeds the
-   httpd socket limit (max_open_sockets defaults to 7) and, because
-   lru_purge_enable is on, the excess connections are reset - the panels for
-   whatever lost the race render empty with no visible error. Chaining keeps the
-   socket count at one no matter how many sections are added later, and these
-   requests are tiny on a LAN. */
+   httpd socket limit (max_open_sockets defaults to 7), and the panels for
+   whatever loses the race render empty. Chaining keeps the socket count at one
+   no matter how many sections are added later, and these requests are tiny on a
+   LAN. The server also has lru_purge_enable off, so an overflow would fail
+   visibly rather than silently. */
 function runSequential(fns,gen){
   var p=Promise.resolve();
   fns.forEach(function(f){
