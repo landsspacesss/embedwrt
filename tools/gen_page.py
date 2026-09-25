@@ -193,6 +193,29 @@ input:focus,select:focus{border-color:#3b82f6}
     <h2 data-i18n='sec_fw'>Firmware update</h2>
     <div class='hint' style='margin:0 0 10px'><span data-i18n='fw_current'></span>
       <b id='fw-version'>-</b> <span class='mono' id='fw-slot'></span></div>
+
+    <div class='form-group'><label data-i18n='ota_freq'></label>
+      <select id='ota-hours'>
+        <option value='0' data-i18n='ota_freq_off'>Off</option>
+        <option value='6' data-i18n='ota_freq_6h'>Every 6 hours</option>
+        <option value='12' data-i18n='ota_freq_12h'>Every 12 hours</option>
+        <option value='24' data-i18n='ota_freq_24h'>Daily</option>
+        <option value='168' data-i18n='ota_freq_7d'>Weekly</option>
+      </select></div>
+    <div class='form-group'><label><input type='checkbox' id='ota-auto' style='width:auto;margin-right:6px'><span data-i18n='ota_auto'></span></label>
+      <div class='hint' style='margin:6px 0 0' data-i18n='ota_auto_hint'></div></div>
+    <div class='form-group'><label data-i18n='ota_url_label'></label><input type='text' id='ota-url' placeholder='http://host/api/v1/repos/owner/repo/releases/latest'></div>
+    <button class='btn' onclick='saveOtaCfg()' data-i18n='ota_save_btn'>SAVE SETTINGS</button>
+
+    <div style='margin-top:14px;padding-top:12px;border-top:1px solid #e2e8f0'>
+      <div id='ota-status' class='hint' style='margin:0 0 8px'></div>
+      <progress id='ota-bar' max='100' value='0' style='display:none;width:100%;height:8px'></progress>
+      <button class='btn' id='ota-check-btn' onclick='otaCheckNow()' data-i18n='ota_check_btn'>CHECK FOR UPDATES</button>
+      <button class='btn danger' id='ota-install-btn' style='display:none' onclick='otaInstallNow()' data-i18n='ota_install_btn'>INSTALL</button>
+      <div id='ota-msg' class='hint' style='margin:8px 0 0'></div>
+    </div>
+
+    <h2 data-i18n='sec_upload'>Manual upload</h2>
     <div class='form-group'><label data-i18n='fw_file'></label><input type='file' id='fw-file' accept='.bin'></div>
     <progress id='fw-bar' max='100' value='0' style='display:none;width:100%;height:8px'></progress>
     <button class='btn danger' id='fw-btn' onclick='otaUpload()' data-i18n='fw_upload_btn'>UPLOAD AND RESTART</button>
@@ -265,6 +288,17 @@ en:{
  fw_failed:'Update failed',fw_nofile:'Choose a firmware file first',
  fw_noback:'The device did not come back. Reload this page to check.',
  fw_ap_note:'The upload takes a minute over WiFi, and DNS and forwarding will stutter while it writes. The access point stays up until the restart.',
+ sec_upload:'Manual upload',
+ ota_freq:'Check for updates',ota_freq_off:'Off',ota_freq_6h:'Every 6 hours',ota_freq_12h:'Every 12 hours',ota_freq_24h:'Daily',ota_freq_7d:'Weekly',
+ ota_auto:'Install new versions without asking',
+ ota_auto_hint:'Off by default: a restart drops every client, so the device waits for you. With this on it installs as soon as it finds a newer release.',
+ ota_url_label:'Release feed URL',ota_save_btn:'SAVE SETTINGS',
+ ota_check_btn:'CHECK FOR UPDATES',ota_checking:'Checking',ota_uptodate:'Up to date',
+ ota_available:'Version {v} is available.',ota_install_btn:'INSTALL AND RESTART',
+ ota_downloading:'Downloading',ota_installing:'Written and verified; restarting',
+ ota_lastcheck:'Last checked',ota_never:'never',ota_failed:'Update check failed',
+ ota_ago_min:'{n} min ago',ota_ago_hour:'{n} h ago',ota_ago_day:'{n} d ago',
+ ota_install_confirm:'Install the new firmware and restart? Every client will drop.',
  login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',
  login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',
  login_failed:'Wrong user or password',login_ok:'Signed in',
@@ -328,6 +362,17 @@ zh:{
  fw_failed:'更新失败',fw_nofile:'请先选择固件文件',
  fw_noback:'设备没有回应。请刷新本页查看。',
  fw_ap_note:'通过 WiFi 上传约需一分钟，写入期间 DNS 和转发会短暂卡顿。热点会保持到重启那一刻。',
+ sec_upload:'手动上传',
+ ota_freq:'检查更新频率',ota_freq_off:'关闭',ota_freq_6h:'每 6 小时',ota_freq_12h:'每 12 小时',ota_freq_24h:'每天',ota_freq_7d:'每周',
+ ota_auto:'发现新版本直接安装，不询问',
+ ota_auto_hint:'默认关闭：重启会踢掉所有客户端，所以由你决定时机。开启后会一发现新版本就自动安装。',
+ ota_url_label:'发布源地址',ota_save_btn:'保存设置',
+ ota_check_btn:'检查更新',ota_checking:'检查中',ota_uptodate:'已是最新',
+ ota_available:'发现新版本 {v}。',ota_install_btn:'安装并重启',
+ ota_downloading:'下载中',ota_installing:'已写入并校验通过，正在重启',
+ ota_lastcheck:'上次检查',ota_never:'从未',ota_failed:'检查更新失败',
+ ota_ago_min:'{n} 分钟前',ota_ago_hour:'{n} 小时前',ota_ago_day:'{n} 天前',
+ ota_install_confirm:'确定安装新固件并重启？所有客户端都会断开。',
  login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',
  login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',
  login_failed:'用户名或密码错误',login_ok:'已登录',
@@ -1061,13 +1106,119 @@ function saveHostname(){
 }
 /* Installed build, and which OTA slot it is running from. The slot is what tells
    you an upload actually switched slots rather than silently doing nothing. */
-function loadFwInfo(){
-  return fetch('/api/version').then(function(r){return r.json()}).then(function(d){
+/* Substitutes {name} placeholders. Applied to the result of t() rather than
+   wrapped around it, so the generator still sees an ordinary lookup call and
+   checks the key exists in both dictionaries. (Wrapping would hide the key from
+   that scan, and the key check does not strip comments, so do not spell a
+   literal lookup call out in prose either - it gets counted as a reference.) */
+function sub(s,vars){
+  if(!vars){return s}
+  for(var p in vars){s=s.split('{'+p+'}').join(vars[p])}
+  return s;
+}
+/* The device only ever sends fixed strings here, so this is belt and braces;
+   it costs nothing and keeps the rule "never interpolate a reply into HTML"
+   from depending on that staying true. */
+function esc(s){
+  return String(s==null?'':s)
+    .split('&').join('&amp;')
+    .split('<').join('&lt;')
+    .split('>').join('&gt;');
+}
+function agoText(secs){
+  if(!secs||secs<=0){return t('ota_never')}
+  if(secs<3600){return sub(t('ota_ago_min'),{n:Math.max(1,Math.round(secs/60))})}
+  if(secs<86400){return sub(t('ota_ago_hour'),{n:Math.round(secs/3600)})}
+  return sub(t('ota_ago_day'),{n:Math.round(secs/86400)});
+}
+/* One request feeds the whole firmware block: version, slot, settings and the
+   update state. */
+function loadUpdateInfo(){
+  return fetch('/api/update').then(function(r){return r.json()}).then(function(d){
     var v=document.getElementById('fw-version');
-    if(v){v.textContent=(d.project||'?')+' '+(d.version||'?')+' ('+(d.date||'?')+' '+(d.time||'?')+')'}
+    if(v){v.textContent=(d.running||'?')}
     var s=document.getElementById('fw-slot');
     if(s){s.textContent=(d.slot?t('fw_slot')+' '+d.slot:'')}
+    var h=document.getElementById('ota-hours');
+    if(h){h.value=String(d.interval_hours)}
+    var a=document.getElementById('ota-auto');
+    if(a){a.checked=!!d.auto_install}
+    var u=document.getElementById('ota-url');
+    /* Never overwrite what the user is in the middle of typing. */
+    if(u&&document.activeElement!==u){u.value=d.url||''}
+    renderOtaState(d);
   }).catch(function(){});
+}
+function renderOtaState(d){
+  var st=document.getElementById('ota-status');
+  var bar=document.getElementById('ota-bar');
+  var inst=document.getElementById('ota-install-btn');
+  var btn=document.getElementById('ota-check-btn');
+  if(!st){return}
+  var line=t('ota_lastcheck')+': '+agoText(d.last_check_ago);
+  var busy=(d.state==='checking'||d.state==='downloading'||d.state==='installing');
+  if(btn){btn.disabled=busy}
+  if(inst){inst.style.display=(d.state==='available')?'inline-block':'none'}
+  if(bar){
+    var show=(d.state==='downloading'||d.state==='installing');
+    bar.style.display=show?'block':'none';
+    bar.value=d.progress||0;
+  }
+  if(d.state==='checking'){st.innerHTML='<span style="color:#64748b">'+t('ota_checking')+'...</span>'}
+  else if(d.state==='downloading'){st.innerHTML='<span style="color:#1d4ed8">'+t('ota_downloading')+' '+(d.progress||0)+'%</span>'}
+  else if(d.state==='installing'){st.innerHTML='<span style="color:#b45309">'+t('ota_installing')+'</span>'}
+  else if(d.state==='available'){st.innerHTML='<span style="color:#15803d"><b>'+sub(t('ota_available'),{v:d.latest})+'</b></span>'}
+  else if(d.state==='uptodate'){st.innerHTML='<span style="color:#15803d">'+t('ota_uptodate')+'</span>'}
+  else if(d.state==='error'){st.innerHTML='<span style="color:#b91c1c">'+t('ota_failed')+': '+esc(d.error)+'</span>'}
+  else{st.innerHTML='<span style="color:#64748b">'+line+'</span>'}
+  /* Keep the "last checked" line visible alongside a result, except when the
+     result already carries the useful information. */
+  if(d.state!=='idle'&&d.state!=='checking'&&line&&d.last_check_ago){st.innerHTML+=' <span style="color:#94a3b8">('+line+')</span>'}
+  if(busy){watchOta()}
+}
+/* Poll while something is in flight. Failures are ignored on purpose: writing
+   flash disables the cache, so the web server can hitch mid-download and a
+   dropped poll means nothing. */
+var otaWatch=null;
+function watchOta(){
+  if(otaWatch){return}
+  otaWatch=setInterval(function(){
+    fetch('/api/update',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+      renderOtaState(d);
+      if(d.state!=='checking'&&d.state!=='downloading'&&d.state!=='installing'){
+        clearInterval(otaWatch);otaWatch=null;
+        /* A reboot follows a successful install; wait it out and say so. */
+        if(d.state==='idle'&&d.running){waitForReboot()}
+      }
+    }).catch(function(){});
+  },2000);
+}
+function saveOtaCfg(){
+  var m=document.getElementById('ota-msg');
+  var h=document.getElementById('ota-hours').value;
+  var a=document.getElementById('ota-auto').checked?'1':'0';
+  var u=document.getElementById('ota-url').value.trim();
+  fetch('/setotacfg',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'hours='+encodeURIComponent(h)+'&auto='+a+'&url='+encodeURIComponent(u)})
+  .then(function(r){return r.text().then(function(x){
+    m.innerHTML=r.ok?('<span style="color:#15803d">'+t('saved')+'</span>')
+                    :('<span style="color:#b91c1c">'+t('rejected')+': '+x+'</span>');
+    loadUpdateInfo();
+  })}).catch(function(){m.innerHTML=t('failed')});
+}
+function otaCheckNow(){
+  var m=document.getElementById('ota-msg');
+  m.innerHTML='';
+  fetch('/ota/check',{method:'POST'}).then(function(){watchOta()}).catch(function(){});
+}
+function otaInstallNow(){
+  if(!confirm(t('ota_install_confirm'))){return}
+  fetch('/ota/install',{method:'POST'}).then(function(){watchOta()}).catch(function(){});
+}
+function loadFwInfo(){
+  /* Kept as the name the settings chain calls; the data now comes from
+     /api/update so a page load makes one request, not two. */
+  return loadUpdateInfo();
 }
 /* Waits out the restart, then reports. The delay before the first poll matters:
    the response to the upload arrives while the OLD firmware is still running and

@@ -40,6 +40,7 @@
 
 #include "ap_dhcp.h"
 #include "clients.h"
+#include "fw_update.h"
 #include "dns_rules.h"
 #include "doh_relay.h"
 #include "portmap.h"
@@ -534,6 +535,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *e = event_data;
         ESP_LOGW(TAG_STA, "disconnected, reason=%d", e->reason);
         xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+        /* The updater waits for an address before it will talk to the server, so
+         * it has to be told when one goes away. */
+        fw_update_set_online(false);
         if (s_sta_should_connect) {
             xEventGroupSetBits(s_wifi_eg, STA_NEED_CONNECT_BIT);
         }
@@ -552,6 +556,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         portmap_apply_all(e->ip_info.ip.addr);
         doh_relay_flush_cache(); /* the upstream network may have changed */
         xEventGroupSetBits(s_wifi_eg, WIFI_CONNECTED_BIT);
+        /* Releases the firmware updater, which holds off until there is an
+         * address - the check is an outbound request like any other. */
+        fw_update_set_online(true);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
         /* Emitted by IDF's DHCP server. When the vendored one is in use this
          * never fires; AP_DHCP_EVENT below carries the same information. */
@@ -915,6 +922,29 @@ static const char *html_page =
 "    <h2 data-i18n='sec_fw'>Firmware update</h2>"
 "    <div class='hint' style='margin:0 0 10px'><span data-i18n='fw_current'></span>"
 "      <b id='fw-version'>-</b> <span class='mono' id='fw-slot'></span></div>"
+""
+"    <div class='form-group'><label data-i18n='ota_freq'></label>"
+"      <select id='ota-hours'>"
+"        <option value='0' data-i18n='ota_freq_off'>Off</option>"
+"        <option value='6' data-i18n='ota_freq_6h'>Every 6 hours</option>"
+"        <option value='12' data-i18n='ota_freq_12h'>Every 12 hours</option>"
+"        <option value='24' data-i18n='ota_freq_24h'>Daily</option>"
+"        <option value='168' data-i18n='ota_freq_7d'>Weekly</option>"
+"      </select></div>"
+"    <div class='form-group'><label><input type='checkbox' id='ota-auto' style='width:auto;margin-right:6px'><span data-i18n='ota_auto'></span></label>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='ota_auto_hint'></div></div>"
+"    <div class='form-group'><label data-i18n='ota_url_label'></label><input type='text' id='ota-url' placeholder='http://host/api/v1/repos/owner/repo/releases/latest'></div>"
+"    <button class='btn' onclick='saveOtaCfg()' data-i18n='ota_save_btn'>SAVE SETTINGS</button>"
+""
+"    <div style='margin-top:14px;padding-top:12px;border-top:1px solid #e2e8f0'>"
+"      <div id='ota-status' class='hint' style='margin:0 0 8px'></div>"
+"      <progress id='ota-bar' max='100' value='0' style='display:none;width:100%;height:8px'></progress>"
+"      <button class='btn' id='ota-check-btn' onclick='otaCheckNow()' data-i18n='ota_check_btn'>CHECK FOR UPDATES</button>"
+"      <button class='btn danger' id='ota-install-btn' style='display:none' onclick='otaInstallNow()' data-i18n='ota_install_btn'>INSTALL</button>"
+"      <div id='ota-msg' class='hint' style='margin:8px 0 0'></div>"
+"    </div>"
+""
+"    <h2 data-i18n='sec_upload'>Manual upload</h2>"
 "    <div class='form-group'><label data-i18n='fw_file'></label><input type='file' id='fw-file' accept='.bin'></div>"
 "    <progress id='fw-bar' max='100' value='0' style='display:none;width:100%;height:8px'></progress>"
 "    <button class='btn danger' id='fw-btn' onclick='otaUpload()' data-i18n='fw_upload_btn'>UPLOAD AND RESTART</button>"
@@ -987,6 +1017,17 @@ static const char *html_page =
 " fw_failed:'Update failed',fw_nofile:'Choose a firmware file first',"
 " fw_noback:'The device did not come back. Reload this page to check.',"
 " fw_ap_note:'The upload takes a minute over WiFi, and DNS and forwarding will stutter while it writes. The access point stays up until the restart.',"
+" sec_upload:'Manual upload',"
+" ota_freq:'Check for updates',ota_freq_off:'Off',ota_freq_6h:'Every 6 hours',ota_freq_12h:'Every 12 hours',ota_freq_24h:'Daily',ota_freq_7d:'Weekly',"
+" ota_auto:'Install new versions without asking',"
+" ota_auto_hint:'Off by default: a restart drops every client, so the device waits for you. With this on it installs as soon as it finds a newer release.',"
+" ota_url_label:'Release feed URL',ota_save_btn:'SAVE SETTINGS',"
+" ota_check_btn:'CHECK FOR UPDATES',ota_checking:'Checking',ota_uptodate:'Up to date',"
+" ota_available:'Version {v} is available.',ota_install_btn:'INSTALL AND RESTART',"
+" ota_downloading:'Downloading',ota_installing:'Written and verified; restarting',"
+" ota_lastcheck:'Last checked',ota_never:'never',ota_failed:'Update check failed',"
+" ota_ago_min:'{n} min ago',ota_ago_hour:'{n} h ago',ota_ago_day:'{n} d ago',"
+" ota_install_confirm:'Install the new firmware and restart? Every client will drop.',"
 " login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',"
 " login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',"
 " login_failed:'Wrong user or password',login_ok:'Signed in',"
@@ -1050,6 +1091,17 @@ static const char *html_page =
 " fw_failed:'更新失败',fw_nofile:'请先选择固件文件',"
 " fw_noback:'设备没有回应。请刷新本页查看。',"
 " fw_ap_note:'通过 WiFi 上传约需一分钟，写入期间 DNS 和转发会短暂卡顿。热点会保持到重启那一刻。',"
+" sec_upload:'手动上传',"
+" ota_freq:'检查更新频率',ota_freq_off:'关闭',ota_freq_6h:'每 6 小时',ota_freq_12h:'每 12 小时',ota_freq_24h:'每天',ota_freq_7d:'每周',"
+" ota_auto:'发现新版本直接安装，不询问',"
+" ota_auto_hint:'默认关闭：重启会踢掉所有客户端，所以由你决定时机。开启后会一发现新版本就自动安装。',"
+" ota_url_label:'发布源地址',ota_save_btn:'保存设置',"
+" ota_check_btn:'检查更新',ota_checking:'检查中',ota_uptodate:'已是最新',"
+" ota_available:'发现新版本 {v}。',ota_install_btn:'安装并重启',"
+" ota_downloading:'下载中',ota_installing:'已写入并校验通过，正在重启',"
+" ota_lastcheck:'上次检查',ota_never:'从未',ota_failed:'检查更新失败',"
+" ota_ago_min:'{n} 分钟前',ota_ago_hour:'{n} 小时前',ota_ago_day:'{n} 天前',"
+" ota_install_confirm:'确定安装新固件并重启？所有客户端都会断开。',"
 " login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',"
 " login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',"
 " login_failed:'用户名或密码错误',login_ok:'已登录',"
@@ -1783,13 +1835,119 @@ static const char *html_page =
 "}"
 "/* Installed build, and which OTA slot it is running from. The slot is what tells"
 "   you an upload actually switched slots rather than silently doing nothing. */"
-"function loadFwInfo(){"
-"  return fetch('/api/version').then(function(r){return r.json()}).then(function(d){"
+"/* Substitutes {name} placeholders. Applied to the result of t() rather than"
+"   wrapped around it, so the generator still sees an ordinary lookup call and"
+"   checks the key exists in both dictionaries. (Wrapping would hide the key from"
+"   that scan, and the key check does not strip comments, so do not spell a"
+"   literal lookup call out in prose either - it gets counted as a reference.) */"
+"function sub(s,vars){"
+"  if(!vars){return s}"
+"  for(var p in vars){s=s.split('{'+p+'}').join(vars[p])}"
+"  return s;"
+"}"
+"/* The device only ever sends fixed strings here, so this is belt and braces;"
+"   it costs nothing and keeps the rule \"never interpolate a reply into HTML\""
+"   from depending on that staying true. */"
+"function esc(s){"
+"  return String(s==null?'':s)"
+"    .split('&').join('&amp;')"
+"    .split('<').join('&lt;')"
+"    .split('>').join('&gt;');"
+"}"
+"function agoText(secs){"
+"  if(!secs||secs<=0){return t('ota_never')}"
+"  if(secs<3600){return sub(t('ota_ago_min'),{n:Math.max(1,Math.round(secs/60))})}"
+"  if(secs<86400){return sub(t('ota_ago_hour'),{n:Math.round(secs/3600)})}"
+"  return sub(t('ota_ago_day'),{n:Math.round(secs/86400)});"
+"}"
+"/* One request feeds the whole firmware block: version, slot, settings and the"
+"   update state. */"
+"function loadUpdateInfo(){"
+"  return fetch('/api/update').then(function(r){return r.json()}).then(function(d){"
 "    var v=document.getElementById('fw-version');"
-"    if(v){v.textContent=(d.project||'?')+' '+(d.version||'?')+' ('+(d.date||'?')+' '+(d.time||'?')+')'}"
+"    if(v){v.textContent=(d.running||'?')}"
 "    var s=document.getElementById('fw-slot');"
 "    if(s){s.textContent=(d.slot?t('fw_slot')+' '+d.slot:'')}"
+"    var h=document.getElementById('ota-hours');"
+"    if(h){h.value=String(d.interval_hours)}"
+"    var a=document.getElementById('ota-auto');"
+"    if(a){a.checked=!!d.auto_install}"
+"    var u=document.getElementById('ota-url');"
+"    /* Never overwrite what the user is in the middle of typing. */"
+"    if(u&&document.activeElement!==u){u.value=d.url||''}"
+"    renderOtaState(d);"
 "  }).catch(function(){});"
+"}"
+"function renderOtaState(d){"
+"  var st=document.getElementById('ota-status');"
+"  var bar=document.getElementById('ota-bar');"
+"  var inst=document.getElementById('ota-install-btn');"
+"  var btn=document.getElementById('ota-check-btn');"
+"  if(!st){return}"
+"  var line=t('ota_lastcheck')+': '+agoText(d.last_check_ago);"
+"  var busy=(d.state==='checking'||d.state==='downloading'||d.state==='installing');"
+"  if(btn){btn.disabled=busy}"
+"  if(inst){inst.style.display=(d.state==='available')?'inline-block':'none'}"
+"  if(bar){"
+"    var show=(d.state==='downloading'||d.state==='installing');"
+"    bar.style.display=show?'block':'none';"
+"    bar.value=d.progress||0;"
+"  }"
+"  if(d.state==='checking'){st.innerHTML='<span style=\"color:#64748b\">'+t('ota_checking')+'...</span>'}"
+"  else if(d.state==='downloading'){st.innerHTML='<span style=\"color:#1d4ed8\">'+t('ota_downloading')+' '+(d.progress||0)+'%</span>'}"
+"  else if(d.state==='installing'){st.innerHTML='<span style=\"color:#b45309\">'+t('ota_installing')+'</span>'}"
+"  else if(d.state==='available'){st.innerHTML='<span style=\"color:#15803d\"><b>'+sub(t('ota_available'),{v:d.latest})+'</b></span>'}"
+"  else if(d.state==='uptodate'){st.innerHTML='<span style=\"color:#15803d\">'+t('ota_uptodate')+'</span>'}"
+"  else if(d.state==='error'){st.innerHTML='<span style=\"color:#b91c1c\">'+t('ota_failed')+': '+esc(d.error)+'</span>'}"
+"  else{st.innerHTML='<span style=\"color:#64748b\">'+line+'</span>'}"
+"  /* Keep the \"last checked\" line visible alongside a result, except when the"
+"     result already carries the useful information. */"
+"  if(d.state!=='idle'&&d.state!=='checking'&&line&&d.last_check_ago){st.innerHTML+=' <span style=\"color:#94a3b8\">('+line+')</span>'}"
+"  if(busy){watchOta()}"
+"}"
+"/* Poll while something is in flight. Failures are ignored on purpose: writing"
+"   flash disables the cache, so the web server can hitch mid-download and a"
+"   dropped poll means nothing. */"
+"var otaWatch=null;"
+"function watchOta(){"
+"  if(otaWatch){return}"
+"  otaWatch=setInterval(function(){"
+"    fetch('/api/update',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){"
+"      renderOtaState(d);"
+"      if(d.state!=='checking'&&d.state!=='downloading'&&d.state!=='installing'){"
+"        clearInterval(otaWatch);otaWatch=null;"
+"        /* A reboot follows a successful install; wait it out and say so. */"
+"        if(d.state==='idle'&&d.running){waitForReboot()}"
+"      }"
+"    }).catch(function(){});"
+"  },2000);"
+"}"
+"function saveOtaCfg(){"
+"  var m=document.getElementById('ota-msg');"
+"  var h=document.getElementById('ota-hours').value;"
+"  var a=document.getElementById('ota-auto').checked?'1':'0';"
+"  var u=document.getElementById('ota-url').value.trim();"
+"  fetch('/setotacfg',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'hours='+encodeURIComponent(h)+'&auto='+a+'&url='+encodeURIComponent(u)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>')"
+"                    :('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"    loadUpdateInfo();"
+"  })}).catch(function(){m.innerHTML=t('failed')});"
+"}"
+"function otaCheckNow(){"
+"  var m=document.getElementById('ota-msg');"
+"  m.innerHTML='';"
+"  fetch('/ota/check',{method:'POST'}).then(function(){watchOta()}).catch(function(){});"
+"}"
+"function otaInstallNow(){"
+"  if(!confirm(t('ota_install_confirm'))){return}"
+"  fetch('/ota/install',{method:'POST'}).then(function(){watchOta()}).catch(function(){});"
+"}"
+"function loadFwInfo(){"
+"  /* Kept as the name the settings chain calls; the data now comes from"
+"     /api/update so a page load makes one request, not two. */"
+"  return loadUpdateInfo();"
 "}"
 "/* Waits out the restart, then reports. The delay before the first poll matters:"
 "   the response to the upload arrives while the OLD firmware is still running and"
@@ -2837,59 +2995,50 @@ static void ota_drain(httpd_req_t *req, int remaining)
     }
 }
 
-static void ota_reboot_cb(void *arg)
-{
-    esp_restart();
-}
-
 /*
  * Accepts the app image as a raw request body (not multipart), so there is no
  * form parsing: the browser sends the File object itself and we stream it
  * straight into the inactive slot.
  *
- * The boot partition is switched only after esp_ota_end() accepts the image, so
- * a truncated upload, a corrupt image or a failed write leaves the running
- * firmware untouched - there is no half-written-image brick.
+ * The slot selection, the validation and the boot-partition switch all live in
+ * fw_update.c, shared with the automatic updater. That sequence decides what
+ * the device boots next; a second copy of it here would eventually disagree
+ * with the first, and the consequence of that disagreement is a device that
+ * does not come back.
+ *
+ * The boot partition is switched only after the image is fully written and
+ * accepted, so a truncated upload, a corrupt image or a failed write leaves the
+ * running firmware untouched.
  */
-#define OTA_CHUNK 4096
-
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
     if (req->content_len <= 0) {
         return ota_fail(req, "400 Bad Request", "empty body");
     }
 
-    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
-    if (part == NULL) {
-        ESP_LOGE(TAG_MAIN, "no OTA slot to write to");
+    const esp_partition_t *part = NULL;
+    esp_ota_handle_t handle = 0;
+    esp_err_t err = fw_ota_begin((size_t)req->content_len, &part, &handle);
+    if (err != ESP_OK) {
         ota_drain(req, req->content_len);
-        return ota_fail(req, "500 Internal Server Error", "no OTA partition");
-    }
-    if ((size_t)req->content_len > part->size) {
-        ESP_LOGE(TAG_MAIN, "OTA: %d bytes does not fit %s (%u bytes)",
-                 (int)req->content_len, part->label, (unsigned)part->size);
-        ota_drain(req, req->content_len);
-        return ota_fail(req, "400 Bad Request", "image is larger than the OTA slot");
+        switch (err) {
+        case ESP_ERR_INVALID_SIZE:
+            return ota_fail(req, "400 Bad Request", "image is larger than the OTA slot");
+        case ESP_ERR_NOT_FOUND:
+            return ota_fail(req, "500 Internal Server Error", "no OTA partition");
+        default:
+            return ota_fail(req, "500 Internal Server Error", "cannot start the update");
+        }
     }
 
     ESP_LOGW(TAG_MAIN, "OTA: writing %d bytes to %s",
              (int)req->content_len, part->label);
 
-    /* Pass the real length rather than OTA_SIZE_UNKNOWN: it erases only the
-     * sectors the image needs instead of the whole 4 MB slot. */
-    esp_ota_handle_t handle = 0;
-    esp_err_t err = esp_ota_begin(part, (size_t)req->content_len, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_MAIN, "esp_ota_begin: %s", esp_err_to_name(err));
-        ota_drain(req, req->content_len);
-        return ota_fail(req, "500 Internal Server Error", "cannot start the update");
-    }
-
     /* Internal RAM on purpose. esp_ota_write runs with the flash cache off, and
      * on this chip PSRAM is only reachable through that cache. */
-    char *buf = heap_caps_malloc(OTA_CHUNK, MALLOC_CAP_INTERNAL);
+    char *buf = heap_caps_malloc(FW_OTA_CHUNK, MALLOC_CAP_INTERNAL);
     if (buf == NULL) {
-        esp_ota_abort(handle);
+        fw_ota_abort(handle);
         ota_drain(req, req->content_len);
         return ota_fail(req, "500 Internal Server Error", "out of memory");
     }
@@ -2900,7 +3049,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     esp_err_t write_err = ESP_OK;
 
     while (remaining > 0) {
-        int want = (remaining < OTA_CHUNK) ? remaining : OTA_CHUNK;
+        int want = (remaining < FW_OTA_CHUNK) ? remaining : FW_OTA_CHUNK;
         int got = httpd_req_recv(req, buf, want);
         if (got == HTTPD_SOCK_ERR_TIMEOUT) {
             /* A WiFi hiccup, not a reason to throw the upload away. */
@@ -2926,59 +3075,38 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     free(buf);
 
     if (why != NULL) {
-        esp_ota_abort(handle);
+        fw_ota_abort(handle);
         /* remaining > 0 here: the loop stopped part way through the body. */
         ota_drain(req, remaining);
         ESP_LOGE(TAG_MAIN, "OTA aborted after %d bytes: %s (%s)",
                  total, why, esp_err_to_name(write_err));
-        if (write_err == ESP_ERR_OTA_VALIDATE_FAILED ||
-                write_err == ESP_ERR_INVALID_ARG) {
+        if (fw_ota_err_is_bad_image(write_err)) {
             return ota_fail(req, "400 Bad Request", "not a valid firmware image");
         }
         return ota_fail(req, "500 Internal Server Error", why);
     }
 
-    if ((err = esp_ota_end(handle)) != ESP_OK) {
-        ESP_LOGE(TAG_MAIN, "esp_ota_end: %s", esp_err_to_name(err));
-        return ota_fail(req, "400 Bad Request", "not a valid firmware image");
-    }
-
-    /* esp_ota_end checks that the image is well formed, not that it is ours.
-     * Without this, uploading the bootloader or another project's build is
-     * accepted here and only fails at the next boot. */
-    esp_app_desc_t desc;
-    memset(&desc, 0, sizeof(desc));
-    if (esp_ota_get_partition_description(part, &desc) != ESP_OK) {
-        return ota_fail(req, "400 Bad Request", "image carries no app descriptor");
-    }
-    if (strcmp(desc.project_name, "embedwrt") != 0) {
-        /* Logged, not echoed: the name comes from whatever was uploaded. */
-        ESP_LOGE(TAG_MAIN, "OTA rejected: image is for project '%s', not 'embedwrt'",
-                 desc.project_name);
-        return ota_fail(req, "400 Bad Request", "image is for a different project");
-    }
-
-    if ((err = esp_ota_set_boot_partition(part)) != ESP_OK) {
-        ESP_LOGE(TAG_MAIN, "esp_ota_set_boot_partition: %s", esp_err_to_name(err));
-        return ota_fail(req, "500 Internal Server Error", "cannot switch boot partition");
+    char newver[32] = {0};
+    fw_ota_result_t res = fw_ota_finish(handle, part, newver, sizeof(newver));
+    if (res != FW_OTA_OK) {
+        /* A well-formed image that is simply not ours is the caller's mistake,
+         * so it answers 400; anything else is ours to own. */
+        bool client_fault = (res == FW_OTA_BAD_IMAGE ||
+                             res == FW_OTA_NO_DESCRIPTOR ||
+                             res == FW_OTA_WRONG_PROJECT);
+        return ota_fail(req, client_fault ? "400 Bad Request"
+                                          : "500 Internal Server Error",
+                        fw_ota_result_text(res));
     }
 
     ESP_LOGW(TAG_MAIN, "OTA: %d bytes into %s, version %s; restarting in 2s",
-             total, part->label, desc.version);
+             total, part->label, newver);
     httpd_resp_sendstr(req, "OK");
 
     /* Reboot only once the response is on the wire. Restarting first makes the
      * browser report a network error, and the user cannot tell success from
      * failure. */
-    esp_timer_create_args_t args = {0};
-    args.callback = ota_reboot_cb;
-    args.name = "ota_reboot";
-    esp_timer_handle_t timer = NULL;
-    if (esp_timer_create(&args, &timer) == ESP_OK) {
-        esp_timer_start_once(timer, 2 * 1000 * 1000);
-    } else {
-        esp_restart();
-    }
+    fw_schedule_reboot();
     return ESP_OK;
 }
 
@@ -3004,6 +3132,111 @@ static esp_err_t version_get_handler(httpd_req_t *req)
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     free((void *)json);
     cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* ==================== automatic firmware update ==================== */
+
+static const char *fw_state_name(fw_state_t st)
+{
+    switch (st) {
+    case FW_IDLE:        return "idle";
+    case FW_CHECKING:    return "checking";
+    case FW_UP_TO_DATE:  return "uptodate";
+    case FW_AVAILABLE:   return "available";
+    case FW_DOWNLOADING: return "downloading";
+    case FW_INSTALLING:  return "installing";
+    case FW_ERROR:       return "error";
+    }
+    return "unknown";
+}
+
+/*
+ * Everything the firmware panel needs, in one request.
+ *
+ * /api/version stays as the small probe (it answers "what am I running" and
+ * little else); this is the one the panel polls, including while a download is
+ * in flight, so it has to be cheap and self-contained.
+ */
+static esp_err_t update_get_handler(httpd_req_t *req)
+{
+    fw_status_t s;
+    fw_update_status(&s);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "state", fw_state_name(s.state));
+    cJSON_AddStringToObject(root, "running", s.running);
+    cJSON_AddStringToObject(root, "latest", s.latest);
+    cJSON_AddStringToObject(root, "slot", s.slot);
+    cJSON_AddStringToObject(root, "url", s.url);
+    cJSON_AddStringToObject(root, "error", s.error);
+    cJSON_AddNumberToObject(root, "interval_hours", s.interval_hours);
+    cJSON_AddBoolToObject(root, "auto_install", s.auto_install);
+    cJSON_AddNumberToObject(root, "progress", s.progress);
+    /* Seconds since boot, so the UI can render "checked N minutes ago" without
+     * the device needing a wall clock. 0 means never checked. */
+    cJSON_AddNumberToObject(root, "last_check_ago",
+                            s.last_check_us > 0
+                                ? (double)((esp_timer_get_time() - s.last_check_us) / 1000000)
+                                : 0);
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t ota_check_post_handler(httpd_req_t *req)
+{
+    fw_update_check_now();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t ota_install_post_handler(httpd_req_t *req)
+{
+    fw_update_install_now();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t set_otacfg_post_handler(httpd_req_t *req)
+{
+    char buf[512] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_hours[16] = {0}, raw_auto[8] = {0}, raw_url[288] = {0};
+    if (httpd_query_key_value(buf, "hours", raw_hours, sizeof(raw_hours)) == ESP_OK) {
+        long h = strtol(raw_hours, NULL, 10);
+        if (h < 0) {
+            h = 0;
+        }
+        if (fw_update_set_interval((uint32_t)h) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad interval");
+            return ESP_FAIL;
+        }
+    }
+    if (httpd_query_key_value(buf, "auto", raw_auto, sizeof(raw_auto)) == ESP_OK) {
+        fw_update_set_auto(raw_auto[0] == '1' || strcasecmp(raw_auto, "true") == 0);
+    }
+    if (httpd_query_key_value(buf, "url", raw_url, sizeof(raw_url)) == ESP_OK) {
+        char url_s[288] = {0};
+        url_decode(url_s, sizeof(url_s), raw_url);
+        if (url_s[0] != '\0' && fw_update_set_url(url_s) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "url must be http:// and under 256 characters");
+            return ESP_FAIL;
+        }
+    }
+    httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
@@ -3858,9 +4091,14 @@ static void start_http_server(void)
         { { .uri = "/claim",        .method = HTTP_POST }, claim_post_handler, false },
         { { .uri = "/setdevpolicy", .method = HTTP_POST }, set_devpolicy_post_handler, true },
 
-        /* Firmware update. Admin-only: this rewrites the boot partition. */
+        /* Firmware update. Admin-only: this rewrites the boot partition, and
+         * the automatic updater pulls executable code off the network. */
         { { .uri = "/api/version",  .method = HTTP_GET  }, version_get_handler, true },
         { { .uri = "/ota",          .method = HTTP_POST }, ota_post_handler, true },
+        { { .uri = "/api/update",   .method = HTTP_GET  }, update_get_handler, true },
+        { { .uri = "/ota/check",    .method = HTTP_POST }, ota_check_post_handler, true },
+        { { .uri = "/ota/install",  .method = HTTP_POST }, ota_install_post_handler, true },
+        { { .uri = "/setotacfg",    .method = HTTP_POST }, set_otacfg_post_handler, true },
 
         { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
         { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },
@@ -4025,6 +4263,10 @@ void app_main(void)
     start_sntp();
     start_http_server();
     start_mdns();
+
+    /* After the network is on its way: the task it creates immediately blocks
+     * until the station has an address. */
+    fw_update_init();
 
     /* Reaching here means the image boots far enough to bring up WiFi, the DNS
      * relay and the panel, so it counts as good and a boot-time rollback is
