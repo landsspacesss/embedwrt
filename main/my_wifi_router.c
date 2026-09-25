@@ -23,6 +23,7 @@
 #include "mdns.h"
 #include "esp_tls_crypto.h"   /* esp_crypto_base64_encode, for HTTP Basic auth */
 #include "ap_acl.h"
+#include "web_auth.h"
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
@@ -183,124 +184,35 @@ static void generate_ap_password(void)
 typedef struct {
     httpd_uri_t uri;                       /* handler/user_ctx filled in at registration */
     esp_err_t (*real)(httpd_req_t *);
+    bool admin_only;                       /* guests get 401 instead of the handler */
 } route_t;
 
-/* ======================= panel authentication ======================= */
+/* ======================= route authorization ======================= */
 
 /*
- * HTTP Basic auth over the panel, enabled only once a password has been set.
+ * The per-request gate. Role resolution and the session table live in
+ * web_auth.c; this only decides whether the route may run.
  *
- * TLS would be better, but this is plain HTTP on a LAN and the panel has no
- * session concept, so Basic is the honest fit: the browser handles the prompt
- * and the credential, and there is no login page or cookie to get wrong. The
- * trade-off is that the credential is only base64-encoded and travels in clear
- * on every request - acceptable on a home LAN, and far better than the open
- * panel it replaces, but worth stating rather than implying otherwise.
- *
- * An empty password means the panel stays open, which is the default the user
- * chose. That is announced at boot so it is never a silent state.
- *
- * If the password is forgotten there is no in-band recovery (the panel that
- * would let you change it is protected). Erase the NVS partition:
- *   esptool.py -p /dev/ttyACM0 erase_region 0x9000 0x6000
- * which clears the panel password along with the other stored settings.
+ * Every route goes through here (registration sets it as the handler and passes
+ * itself as user_ctx), so a new endpoint cannot be added without a decision
+ * about who may reach it - the admin_only flag is not optional at the call site
+ * because the struct initialiser would leave it false, which is the safe
+ * default only if reviewed. Admin-only routes are listed explicitly below.
  */
-static char s_web_user[33] = "admin";
-static char s_web_pass[65] = "";                  /* empty => panel open */
-static char s_expected_auth[192] = "";            /* "Basic <base64(user:pass)>" */
-
-/*
- * esp_http_server serves requests from a single task (one connection at a time,
- * non-blocking mode off), so this state is never touched concurrently and needs
- * no lock. Were the server ever made multi-task, this is the first thing that
- * would need one.
- */
-static void rebuild_expected_auth(void)
-{
-    if (s_web_pass[0] == '\0') {
-        s_expected_auth[0] = '\0';
-        return;
-    }
-    char user_info[128];
-    int n = snprintf(user_info, sizeof(user_info), "%s:%s", s_web_user, s_web_pass);
-    unsigned char b64[176];
-    size_t olen = 0;
-    if (n <= 0 || n >= (int)sizeof(user_info) ||
-            esp_crypto_base64_encode(b64, sizeof(b64) - 1, &olen,
-                                     (const unsigned char *)user_info,
-                                     strlen(user_info)) != 0) {
-        /* Fail closed: an unbuildable credential must not leave the panel open. */
-        s_expected_auth[0] = '\0';
-        ESP_LOGE(TAG_MAIN, "cannot build the panel credential; panel left open");
-        return;
-    }
-    b64[olen] = '\0';
-    snprintf(s_expected_auth, sizeof(s_expected_auth), "Basic %s", (char *)b64);
-}
-
-static void load_panel_auth(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        size_t len = sizeof(s_web_user);
-        if (nvs_get_str(h, "web_user", s_web_user, &len) != ESP_OK || s_web_user[0] == '\0') {
-            strncpy(s_web_user, "admin", sizeof(s_web_user) - 1);
-        }
-        len = sizeof(s_web_pass);
-        nvs_get_str(h, "web_pass", s_web_pass, &len);
-        nvs_close(h);
-    }
-    rebuild_expected_auth();
-    if (s_web_pass[0] == '\0') {
-        ESP_LOGW(TAG_MAIN, "panel password not set: the web interface is OPEN to "
-                           "anyone who can reach it");
-    } else {
-        ESP_LOGI(TAG_MAIN, "panel protected, user '%s'", s_web_user);
-    }
-}
-
-static esp_err_t save_panel_auth(void)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
-        return ESP_FAIL;
-    }
-    nvs_set_str(h, "web_user", s_web_user);
-    nvs_set_str(h, "web_pass", s_web_pass);
-    nvs_commit(h);
-    nvs_close(h);
-    return ESP_OK;
-}
-
-static bool auth_ok(httpd_req_t *req)
-{
-    if (s_expected_auth[0] == '\0') {
-        return true;   /* no password set */
-    }
-    size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
-    if (len == 0 || len > 255) {
-        return false;
-    }
-    char buf[256];
-    if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) != ESP_OK) {
-        return false;
-    }
-    /* Constant-time compare is not warranted here: the credential is sent in
-     * clear over the same connection, so a timing side channel on a LAN gains an
-     * attacker nothing they could not read directly. */
-    return strcmp(buf, s_expected_auth) == 0;
-}
-
 static esp_err_t auth_trampoline(httpd_req_t *req)
 {
-    /* user_ctx points at the route table entry, set at registration. */
     const route_t *r = (const route_t *)req->user_ctx;
+    if (r == NULL || r->real == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
-    if (!auth_ok(req)) {
+    if (r->admin_only && web_auth_role_of(req) != WEB_ROLE_ADMIN) {
+        /* 401 rather than 403: the caller can fix this by logging in, and the
+         * UI keys its login prompt off exactly this status. */
         httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"EmbedWRT\"");
-        httpd_resp_set_type(req, "text/plain");
-        httpd_resp_send(req, "authentication required", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"login required\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     return r->real(req);
@@ -2191,12 +2103,95 @@ static esp_err_t set_ssid_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Who am I, and is authentication even on? Drives the header and the UI. */
+static esp_err_t session_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    web_role_t role = web_auth_role_of(req);
+    cJSON_AddBoolToObject(root, "auth_enabled", web_auth_enabled());
+    cJSON_AddStringToObject(root, "role", role == WEB_ROLE_ADMIN ? "admin" : "guest");
+    cJSON_AddStringToObject(root, "user", web_auth_user());
+    cJSON_AddNumberToObject(root, "session_seconds", web_auth_session_seconds());
+
+    /* A guest's own device, so the UI can say which one it is showing. */
+    uint32_t ip = 0;
+    if (web_auth_client_ip(req, &ip)) {
+        esp_ip4_addr_t a = { .addr = ip };
+        char b[16];
+        snprintf(b, sizeof(b), IPSTR, IP2STR(&a));
+        cJSON_AddStringToObject(root, "client_ip", b);
+    }
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t login_post_handler(httpd_req_t *req)
+{
+    char buf[256] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_user[64] = {0}, raw_pass[128] = {0};
+    httpd_query_key_value(buf, "user", raw_user, sizeof(raw_user));
+    if (httpd_query_key_value(buf, "pass", raw_pass, sizeof(raw_pass)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"password required\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char user[64] = {0}, pass[128] = {0};
+    url_decode(user, sizeof(user), raw_user);
+    url_decode(pass, sizeof(pass), raw_pass);
+    if (user[0] == '\0') {
+        snprintf(user, sizeof(user), "%s", web_auth_user());
+    }
+
+    char token[WEB_TOKEN_LEN + 1];
+    esp_err_t err = web_auth_login(user, pass, token, sizeof(token));
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"invalid credentials\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    /* The buffer must outlive the send: httpd_resp_set_hdr() stores the pointer
+     * rather than copying it, so a helper-local buffer would be read back from
+     * reused stack. */
+    char cookie[160];
+    web_auth_cookie_for(token, cookie, sizeof(cookie));
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t logout_post_handler(httpd_req_t *req)
+{
+    web_auth_logout(req);
+    httpd_resp_set_hdr(req, "Set-Cookie", WEB_AUTH_COOKIE_CLEAR);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* Admin-only view of the credential state. */
 static esp_err_t webauth_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "user", s_web_user);
-    /* Never send the password itself - only whether one is set. */
-    cJSON_AddBoolToObject(root, "enabled", s_web_pass[0] != '\0');
+    cJSON_AddStringToObject(root, "user", web_auth_user());
+    /* Never the password itself - only whether one is set. */
+    cJSON_AddBoolToObject(root, "enabled", web_auth_enabled());
     const char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
@@ -2226,35 +2221,22 @@ static esp_err_t set_webauth_post_handler(httpd_req_t *req)
     url_decode(user, sizeof(user), raw_user);
     url_decode(pass, sizeof(pass), raw_pass);
 
-    if (pass[0] == '\0') {
-        /* Disabling is deliberate, so do it rather than refuse. */
-        s_web_pass[0] = '\0';
-        save_panel_auth();
-        rebuild_expected_auth();
-        ESP_LOGW(TAG_MAIN, "panel password cleared: the web interface is now OPEN");
-        httpd_resp_sendstr(req, "OK");
-        return ESP_OK;
-    }
-
-    if (strlen(pass) < 8 || strlen(pass) > 64) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password must be 8-64 characters");
-        return ESP_FAIL;
-    }
-    if (user[0] == '\0' || strlen(user) > 32 || strchr(user, ':') != NULL) {
+    esp_err_t err = web_auth_set_credentials(user, pass);
+    if (err == ESP_ERR_INVALID_ARG) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "user must be 1-32 characters and contain no ':'");
+                            "password must be 8-64 characters; user 1-32 with no ':'");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    strncpy(s_web_user, user, sizeof(s_web_user) - 1);
-    s_web_user[sizeof(s_web_user) - 1] = '\0';
-    strncpy(s_web_pass, pass, sizeof(s_web_pass) - 1);
-    s_web_pass[sizeof(s_web_pass) - 1] = '\0';
-    save_panel_auth();
-    rebuild_expected_auth();
-    ESP_LOGI(TAG_MAIN, "panel credentials updated, user '%s'", s_web_user);
-
-    /* The browser now holds a stale credential, so tell it to re-prompt. */
+    /* Every session was dropped, including this one if a password is now set, so
+     * tell the UI to re-establish itself. */
+    if (web_auth_enabled()) {
+        httpd_resp_set_status(req, "200 OK");
+    }
     httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
@@ -2883,7 +2865,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 48;
+    cfg.max_uri_handlers = 52;
     cfg.stack_size = 6144;
     /* Page loads serialise their requests, so the default socket limit of 7 is
      * not reached. Purging stays off deliberately: with it on, an overflow
@@ -2901,40 +2883,43 @@ static void start_http_server(void)
     /* Static, because httpd_register_uri_handler stores the user_ctx pointer and
      * it has to outlive this call. */
     static route_t routes[] = {
-        { { .uri = "/",           .method = HTTP_GET  }, root_get_handler },
-        { { .uri = "/status",     .method = HTTP_GET  }, status_get_handler },
-        { { .uri = "/scan",       .method = HTTP_GET  }, scan_get_handler },
-        { { .uri = "/connect",    .method = HTTP_POST }, connect_post_handler },
-        { { .uri = "/api/appass", .method = HTTP_GET  }, ap_pass_get_handler },
-        { { .uri = "/setpass",    .method = HTTP_POST }, set_pass_post_handler },
-        { { .uri = "/resetpass",  .method = HTTP_POST }, reset_pass_handler },
-        { { .uri = "/api/dohurl", .method = HTTP_GET  }, doh_url_get_handler },
-        { { .uri = "/setdohurl",  .method = HTTP_POST }, set_doh_url_post_handler },
-        { { .uri = "/api/clients", .method = HTTP_GET }, clients_get_handler },
-        { { .uri = "/api/radio",   .method = HTTP_GET  }, radio_get_handler },
-        { { .uri = "/setradio",    .method = HTTP_POST }, set_radio_post_handler },
-        { { .uri = "/api/leases",  .method = HTTP_GET  }, leases_get_handler },
-        { { .uri = "/lease/add",   .method = HTTP_POST }, add_lease_post_handler },
-        { { .uri = "/lease/del",   .method = HTTP_POST }, del_lease_post_handler },
-        { { .uri = "/api/dnsrules", .method = HTTP_GET  }, dnsrules_get_handler },
-        { { .uri = "/api/hostname", .method = HTTP_GET  }, hostname_get_handler },
-        { { .uri = "/sethostname",  .method = HTTP_POST }, set_hostname_post_handler },
-        { { .uri = "/dnsrule/set",  .method = HTTP_POST }, set_dnsrule_post_handler },
-        { { .uri = "/dnsrule/del",  .method = HTTP_POST }, del_dnsrule_post_handler },
-        { { .uri = "/api/dnstest",  .method = HTTP_GET  }, dnstest_get_handler },
-        { { .uri = "/api/portmaps", .method = HTTP_GET  }, portmaps_get_handler },
-        { { .uri = "/portmap/add",  .method = HTTP_POST }, add_portmap_post_handler },
-        { { .uri = "/portmap/del",  .method = HTTP_POST }, del_portmap_post_handler },
-        { { .uri = "/api/ssid",     .method = HTTP_GET  }, ssid_get_handler },
-        { { .uri = "/api/apcfg",   .method = HTTP_GET  }, apcfg_get_handler },
-        { { .uri = "/setapcfg",    .method = HTTP_POST }, set_apcfg_post_handler },
-        { { .uri = "/api/acl",     .method = HTTP_GET  }, acl_get_handler },
-        { { .uri = "/acl/add",     .method = HTTP_POST }, acl_add_post_handler },
-        { { .uri = "/acl/del",     .method = HTTP_POST }, acl_del_post_handler },
-        { { .uri = "/acl/enable",  .method = HTTP_POST }, acl_enable_post_handler },
-        { { .uri = "/setssid",      .method = HTTP_POST }, set_ssid_post_handler },
-        { { .uri = "/api/webauth",  .method = HTTP_GET  }, webauth_get_handler },
-        { { .uri = "/setwebauth",   .method = HTTP_POST }, set_webauth_post_handler },
+        { { .uri = "/",                 .method = HTTP_GET }, root_get_handler, false },
+        { { .uri = "/status",           .method = HTTP_GET }, status_get_handler, true },
+        { { .uri = "/scan",             .method = HTTP_GET }, scan_get_handler, true },
+        { { .uri = "/connect",          .method = HTTP_POST }, connect_post_handler, true },
+        { { .uri = "/api/appass",       .method = HTTP_GET }, ap_pass_get_handler, true },
+        { { .uri = "/setpass",          .method = HTTP_POST }, set_pass_post_handler, true },
+        { { .uri = "/resetpass",        .method = HTTP_POST }, reset_pass_handler, true },
+        { { .uri = "/api/dohurl",       .method = HTTP_GET }, doh_url_get_handler, true },
+        { { .uri = "/setdohurl",        .method = HTTP_POST }, set_doh_url_post_handler, true },
+        { { .uri = "/api/clients",      .method = HTTP_GET }, clients_get_handler, true },
+        { { .uri = "/api/radio",        .method = HTTP_GET }, radio_get_handler, true },
+        { { .uri = "/setradio",         .method = HTTP_POST }, set_radio_post_handler, true },
+        { { .uri = "/api/leases",       .method = HTTP_GET }, leases_get_handler, true },
+        { { .uri = "/lease/add",        .method = HTTP_POST }, add_lease_post_handler, true },
+        { { .uri = "/lease/del",        .method = HTTP_POST }, del_lease_post_handler, true },
+        { { .uri = "/api/dnsrules",     .method = HTTP_GET }, dnsrules_get_handler, true },
+        { { .uri = "/api/hostname",     .method = HTTP_GET }, hostname_get_handler, true },
+        { { .uri = "/sethostname",      .method = HTTP_POST }, set_hostname_post_handler, true },
+        { { .uri = "/dnsrule/set",      .method = HTTP_POST }, set_dnsrule_post_handler, true },
+        { { .uri = "/dnsrule/del",      .method = HTTP_POST }, del_dnsrule_post_handler, true },
+        { { .uri = "/api/dnstest",      .method = HTTP_GET }, dnstest_get_handler, true },
+        { { .uri = "/api/portmaps",     .method = HTTP_GET }, portmaps_get_handler, true },
+        { { .uri = "/portmap/add",      .method = HTTP_POST }, add_portmap_post_handler, true },
+        { { .uri = "/portmap/del",      .method = HTTP_POST }, del_portmap_post_handler, true },
+        { { .uri = "/api/ssid",         .method = HTTP_GET }, ssid_get_handler, true },
+        { { .uri = "/api/apcfg",        .method = HTTP_GET }, apcfg_get_handler, true },
+        { { .uri = "/setapcfg",         .method = HTTP_POST }, set_apcfg_post_handler, true },
+        { { .uri = "/api/acl",          .method = HTTP_GET }, acl_get_handler, true },
+        { { .uri = "/acl/add",          .method = HTTP_POST }, acl_add_post_handler, true },
+        { { .uri = "/acl/del",          .method = HTTP_POST }, acl_del_post_handler, true },
+        { { .uri = "/acl/enable",       .method = HTTP_POST }, acl_enable_post_handler, true },
+        { { .uri = "/setssid",          .method = HTTP_POST }, set_ssid_post_handler, true },
+        { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
+        { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },
+        { { .uri = "/logout",           .method = HTTP_POST }, logout_post_handler, false },
+        { { .uri = "/api/webauth",      .method = HTTP_GET }, webauth_get_handler, true },
+        { { .uri = "/setwebauth",       .method = HTTP_POST }, set_webauth_post_handler, true },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
@@ -2966,7 +2951,7 @@ void app_main(void)
     load_doh_url();
     load_mdns_host();
     load_ap_ssid();
-    load_panel_auth();
+    web_auth_init();
     load_ap_settings();
     ap_acl_init();
     load_radio_settings();
