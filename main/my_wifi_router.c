@@ -21,6 +21,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "mdns.h"
+#include "esp_tls_crypto.h"   /* esp_crypto_base64_encode, for HTTP Basic auth */
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
@@ -39,7 +40,9 @@
 #include "static_leases.h"
 #include "led_off.h"
 
-#define AP_SSID_PREFIX    "ESPWIFI"
+/* Default AP name; the live value is stored in NVS and editable from the
+ * settings page, so a rename does not need a reflash. */
+#define AP_SSID_PREFIX    "EMBEDWRT"
 #define AP_MAX_CONN      7
 #define AP_PASSWORD_LEN   8    /* length of a freshly generated password */
 #define AP_PASSWORD_MAX   64   /* longest password the web UI may set (63 usable) */
@@ -71,7 +74,7 @@ static volatile bool s_sta_should_connect = false;
 
 static char sta_ssid[33] = {0};
 static char sta_password[65] = {0};
-static char ap_ssid_full[33] = {0};
+static char ap_ssid_full[33] = {0};   /* the live AP name, from NVS or the default */
 static char ap_password[AP_PASSWORD_MAX] = {0};
 static char doh_url[DOH_URL_MAX] = DOH_DEFAULT_URL;
 
@@ -170,6 +173,206 @@ static void generate_ap_password(void)
         ap_password[i] = alphabet[raw[i] % (sizeof(alphabet) - 1)];
     }
     ap_password[AP_PASSWORD_LEN] = '\0';
+}
+
+/*
+ * A registered route: the httpd entry plus the real handler. Every route is
+ * registered through the table below with the auth trampoline in front, so a new
+ * endpoint cannot accidentally be added without authentication.
+ */
+typedef struct {
+    httpd_uri_t uri;                       /* handler/user_ctx filled in at registration */
+    esp_err_t (*real)(httpd_req_t *);
+} route_t;
+
+/* ======================= panel authentication ======================= */
+
+/*
+ * HTTP Basic auth over the panel, enabled only once a password has been set.
+ *
+ * TLS would be better, but this is plain HTTP on a LAN and the panel has no
+ * session concept, so Basic is the honest fit: the browser handles the prompt
+ * and the credential, and there is no login page or cookie to get wrong. The
+ * trade-off is that the credential is only base64-encoded and travels in clear
+ * on every request - acceptable on a home LAN, and far better than the open
+ * panel it replaces, but worth stating rather than implying otherwise.
+ *
+ * An empty password means the panel stays open, which is the default the user
+ * chose. That is announced at boot so it is never a silent state.
+ *
+ * If the password is forgotten there is no in-band recovery (the panel that
+ * would let you change it is protected). Erase the NVS partition:
+ *   esptool.py -p /dev/ttyACM0 erase_region 0x9000 0x6000
+ * which clears the panel password along with the other stored settings.
+ */
+static char s_web_user[33] = "admin";
+static char s_web_pass[65] = "";                  /* empty => panel open */
+static char s_expected_auth[192] = "";            /* "Basic <base64(user:pass)>" */
+
+/*
+ * esp_http_server serves requests from a single task (one connection at a time,
+ * non-blocking mode off), so this state is never touched concurrently and needs
+ * no lock. Were the server ever made multi-task, this is the first thing that
+ * would need one.
+ */
+static void rebuild_expected_auth(void)
+{
+    if (s_web_pass[0] == '\0') {
+        s_expected_auth[0] = '\0';
+        return;
+    }
+    char user_info[128];
+    int n = snprintf(user_info, sizeof(user_info), "%s:%s", s_web_user, s_web_pass);
+    unsigned char b64[176];
+    size_t olen = 0;
+    if (n <= 0 || n >= (int)sizeof(user_info) ||
+            esp_crypto_base64_encode(b64, sizeof(b64) - 1, &olen,
+                                     (const unsigned char *)user_info,
+                                     strlen(user_info)) != 0) {
+        /* Fail closed: an unbuildable credential must not leave the panel open. */
+        s_expected_auth[0] = '\0';
+        ESP_LOGE(TAG_MAIN, "cannot build the panel credential; panel left open");
+        return;
+    }
+    b64[olen] = '\0';
+    snprintf(s_expected_auth, sizeof(s_expected_auth), "Basic %s", (char *)b64);
+}
+
+static void load_panel_auth(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(s_web_user);
+        if (nvs_get_str(h, "web_user", s_web_user, &len) != ESP_OK || s_web_user[0] == '\0') {
+            strncpy(s_web_user, "admin", sizeof(s_web_user) - 1);
+        }
+        len = sizeof(s_web_pass);
+        nvs_get_str(h, "web_pass", s_web_pass, &len);
+        nvs_close(h);
+    }
+    rebuild_expected_auth();
+    if (s_web_pass[0] == '\0') {
+        ESP_LOGW(TAG_MAIN, "panel password not set: the web interface is OPEN to "
+                           "anyone who can reach it");
+    } else {
+        ESP_LOGI(TAG_MAIN, "panel protected, user '%s'", s_web_user);
+    }
+}
+
+static esp_err_t save_panel_auth(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    nvs_set_str(h, "web_user", s_web_user);
+    nvs_set_str(h, "web_pass", s_web_pass);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static bool auth_ok(httpd_req_t *req)
+{
+    if (s_expected_auth[0] == '\0') {
+        return true;   /* no password set */
+    }
+    size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (len == 0 || len > 255) {
+        return false;
+    }
+    char buf[256];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) != ESP_OK) {
+        return false;
+    }
+    /* Constant-time compare is not warranted here: the credential is sent in
+     * clear over the same connection, so a timing side channel on a LAN gains an
+     * attacker nothing they could not read directly. */
+    return strcmp(buf, s_expected_auth) == 0;
+}
+
+static esp_err_t auth_trampoline(httpd_req_t *req)
+{
+    /* user_ctx points at the route table entry, set at registration. */
+    const route_t *r = (const route_t *)req->user_ctx;
+
+    if (!auth_ok(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"EmbedWRT\"");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_send(req, "authentication required", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    return r->real(req);
+}
+
+/* ======================= AP name ======================= */
+
+/*
+ * The AP name is a stored setting rather than a compile-time constant, so it can
+ * be changed without a reflash. Changing it restarts the radio (the same path
+ * the AP password change takes), which drops every client and the upstream link
+ * for a moment - unavoidable, since the SSID is broadcast in the beacon and
+ * cannot be altered in place.
+ */
+static void load_ap_ssid(void)
+{
+    nvs_handle_t h;
+    size_t len = sizeof(ap_ssid_full);
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_str(h, "ap_ssid", ap_ssid_full, &len) == ESP_OK && ap_ssid_full[0] != '\0') {
+            nvs_close(h);
+            ESP_LOGI(TAG_MAIN, "AP name from NVS: '%s'", ap_ssid_full);
+            return;
+        }
+        nvs_close(h);
+    }
+
+    /* First boot: derive a unique default from the MAC and store it, so the
+     * name the user sees is the one that is persisted. */
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(ap_ssid_full, sizeof(ap_ssid_full), "%s-%02X%02X",
+             AP_SSID_PREFIX, mac[4], mac[5]);
+
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ap_ssid", ap_ssid_full);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static esp_err_t save_ap_ssid(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    esp_err_t err = nvs_set_str(h, "ap_ssid", ap_ssid_full);
+    nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+/* An SSID is a byte string of 1-32 octets. Control characters are excluded
+ * because they are invisible or break clients' display, and a leading/trailing
+ * space is almost always a typo the user cannot see. */
+static bool valid_ssid(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n > 32) {
+        return false;
+    }
+    if (s[0] == ' ' || s[n - 1] == ' ') {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7F) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ======================= radio tuning ======================= */
@@ -426,7 +629,7 @@ static void sta_reconnect_task(void *arg)
  * component's PREDEF_NETIF_STA/AP default on): the station advertises this
  * device's upstream address and the AP advertises 192.168.4.1.
  */
-static char s_mdns_host[33] = "espwifi";
+static char s_mdns_host[33] = "embedwrt";
 
 static void load_mdns_host(void)
 {
@@ -436,7 +639,7 @@ static void load_mdns_host(void)
     }
     size_t len = sizeof(s_mdns_host);
     if (nvs_get_str(h, "mdns_host", s_mdns_host, &len) != ESP_OK) {
-        strncpy(s_mdns_host, "espwifi", sizeof(s_mdns_host) - 1);
+        strncpy(s_mdns_host, "embedwrt", sizeof(s_mdns_host) - 1);
     }
     nvs_close(h);
 }
@@ -513,425 +716,510 @@ static void start_sntp(void)
 /* ======================= web interface ======================= */
 
 static const char *html_page =
-"<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>ESP32 Repeater</title>"
+"<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>EmbedWRT</title>"
 "<link rel='icon' href='data:,'>"
 "<style>"
 "*{box-sizing:border-box;margin:0;padding:0}"
-"body{font-family:system-ui,-apple-system,sans-serif;background:#f4f6f9;display:flex;justify-content:center;align-items:center;min-height:100vh;color:#1e293b}"
-".card{background:#fff;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.05);width:100%;max-width:400px;overflow:hidden}"
-".header{background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;text-align:center;color:#fff}"
-".header-icon{margin-bottom:8px}"
+"body{font-family:system-ui,-apple-system,'Noto Sans SC','Microsoft YaHei',sans-serif;background:#f4f6f9;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;color:#1e293b;padding:16px 0}"
+".card{background:#fff;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.05);width:100%;max-width:420px;overflow:hidden}"
+".header{background:linear-gradient(135deg,#1e293b,#334155);padding:20px 24px;text-align:center;color:#fff;position:relative}"
 ".header-icon svg{width:32px;height:32px;fill:#60a5fa}"
 ".header h1{font-size:18px;font-weight:700;color:#f1f5f9;letter-spacing:0.5px}"
 ".header .subtitle{font-size:11px;color:#94a3b8;margin-top:4px}"
+"#lang-btn{position:absolute;top:12px;right:12px;background:rgba(255,255,255,.12);color:#e2e8f0;border:1px solid rgba(255,255,255,.25);border-radius:6px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}"
+"#lang-btn:hover{background:rgba(255,255,255,.22)}"
 ".tabs{display:flex;border-bottom:1px solid #e2e8f0}"
-".tab{flex:1;text-align:center;padding:14px;font-size:13px;font-weight:600;color:#64748b;background:#f8fafc;border:none;cursor:pointer;transition:all 0.2s}"
+".tab{flex:1;text-align:center;padding:14px 6px;font-size:13px;font-weight:600;color:#64748b;background:#f8fafc;border:none;cursor:pointer}"
 ".tab.active{color:#3b82f6;background:#fff;border-bottom:2px solid #3b82f6}"
-".tab-content{display:none;padding:24px}"
+".tab-content{display:none;padding:20px}"
 ".tab-content.active{display:block}"
-".header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}"
-"h1{font-size:20px;color:#0f172a}"
-".refresh-btn{background:#e2e8f0;color:#475569;border:none;padding:8px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:0.2s}"
+".header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}"
+"h1{font-size:19px;color:#0f172a}"
+"h2{font-size:14px;color:#334155;margin:22px 0 8px;padding-top:16px;border-top:1px solid #e2e8f0}"
+"h2:first-of-type{margin-top:8px;padding-top:0;border-top:none}"
+".refresh-btn{background:#e2e8f0;color:#475569;border:none;padding:7px 11px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}"
 ".refresh-btn:hover{background:#cbd5e1}"
 "#status-msg{text-align:center;font-size:13px;margin-bottom:8px;font-weight:500;padding:8px;border-radius:6px;background:#f8fafc}"
-"#dns-msg{text-align:center;font-size:12px;margin-bottom:15px;color:#64748b}"
-".network-list{border:1px solid #e2e8f0;border-radius:8px;margin-bottom:20px;max-height:200px;overflow-y:auto;background:#fafafa}"
-".network-item{display:flex;justify-content:space-between;align-items:center;padding:10px 15px;border-bottom:1px solid #e2e8f0;cursor:pointer;transition:background 0.2s}"
+".hint{font-size:11px;color:#94a3b8;margin-bottom:10px;line-height:1.5}"
+".network-list{border:1px solid #e2e8f0;border-radius:8px;margin-bottom:14px;max-height:200px;overflow-y:auto;background:#fafafa}"
+".network-item{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #e2e8f0;cursor:pointer}"
 ".network-item:last-child{border-bottom:none}"
 ".network-item:hover{background:#f1f5f9}"
-".net-info{display:flex;align-items:center;gap:10px;font-size:14px;color:#334155}"
-".net-icons{display:flex;align-items:center;gap:6px}"
+".net-info{display:flex;align-items:center;gap:8px;font-size:14px;color:#334155}"
 ".icon{width:16px;height:16px}"
 ".icon.secure{fill:#94a3b8}"
-".form-group{margin-bottom:15px}"
-"label{display:block;font-size:13px;color:#475569;margin-bottom:6px;font-weight:500}"
-"input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;outline:none;transition:border 0.2s}"
-"input:focus{border-color:#3b82f6}"
-".btn{width:100%;background:#3b82f6;color:white;border:none;padding:12px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;margin-top:5px}"
+".form-group{margin-bottom:12px}"
+"label{display:block;font-size:12px;color:#475569;margin-bottom:5px;font-weight:500}"
+"input,select{width:100%;padding:9px 11px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;outline:none;background:#fff}"
+"input:focus,select:focus{border-color:#3b82f6}"
+".btn{width:100%;background:#3b82f6;color:white;border:none;padding:11px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;margin-top:4px}"
 ".btn:hover{background:#2563eb}"
 ".btn.danger{background:#ef4444}"
 ".btn.danger:hover{background:#dc2626}"
-".loading{text-align:center;padding:20px;font-size:14px;color:#64748b}"
-".info-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px;margin-bottom:15px;font-size:13px;color:#166534}"
+".btn.small{padding:8px;font-size:12px}"
+".loading{text-align:center;padding:18px;font-size:13px;color:#64748b}"
+".info-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:11px;margin-bottom:12px;font-size:12px;color:#166534;line-height:1.5}"
 ".info-box.warn{background:#fef2f2;border-color:#fecaca;color:#991b1b}"
-".footer{margin-top:20px;padding-top:15px;border-top:1px solid #e2e8f0;text-align:center;font-size:11px;color:#94a3b8}"
-".footer-line{margin-bottom:3px}"
+".row{display:flex;gap:8px}"
+".row>*{flex:1}"
+".footer{margin-top:22px;padding-top:14px;border-top:1px solid #e2e8f0;text-align:center;font-size:11px;color:#94a3b8;line-height:1.6}"
 ".footer a{color:#64748b;text-decoration:none}"
-".footer a:hover{text-decoration:underline}"
+".mono{font-family:ui-monospace,Menlo,Consolas,monospace}"
+".testout{font-size:11px;line-height:1.7;font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}"
 "</style></head><body>"
 "<div class='card'>"
 "  <div class='header'>"
-"    <div class='header-icon'>"
-"      <svg viewBox='0 0 24 24'><path d='M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z'/></svg>"
-"    </div>"
-"    <h1>ESP32 Repeater</h1>"
-"    <div class='subtitle'>WiFi NAT router &middot; DNS over HTTPS</div>"
+"    <button id='lang-btn' onclick='toggleLang()'>中文</button>"
+"    <div class='header-icon'><svg viewBox='0 0 24 24'><path d='M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z'/></svg></div>"
+"    <h1 data-i18n='title'>EmbedWRT</h1>"
+"    <div class='subtitle' data-i18n='subtitle'>WiFi NAT router &middot; DoH / DoT</div>"
 "  </div>"
 "  <div class='tabs'>"
-"    <button class='tab active' onclick='switchTab(\"wifi\")'>WiFi Setup</button>"
-"    <button class='tab' onclick='switchTab(\"clients\")'>Clients</button>"
-"    <button class='tab' onclick='switchTab(\"settings\")'>Settings</button>"
+"    <button class='tab active' onclick='switchTab(\"wifi\",event)' data-i18n='tab_wifi'>WiFi</button>"
+"    <button class='tab' onclick='switchTab(\"clients\",event)' data-i18n='tab_clients'>Clients</button>"
+"    <button class='tab' onclick='switchTab(\"settings\",event)' data-i18n='tab_settings'>Settings</button>"
 "  </div>"
+""
 "  <div id='tab-wifi' class='tab-content active'>"
-"    <div class='header-row'><h1>WiFi Setup</h1><button class='refresh-btn' onclick='scan()'>Refresh</button></div>"
-"    <div id='status-msg'>Checking status...</div>"
-"    <div id='dns-msg'></div>"
-"    <div class='network-list' id='list'><div class='loading'>Scanning networks...</div></div>"
-"    <div class='form-group'><label>SSID</label><input type='text' id='ssid' placeholder='Network Name'></div>"
-"    <div class='form-group'><label>Password</label><input type='password' id='pwd' placeholder='Password (optional)'></div>"
-"    <button class='btn' onclick='connect()'>CONNECT</button>"
+"    <div class='header-row'><h1 data-i18n='wifi_setup'>WiFi</h1><button class='refresh-btn' onclick='scan()' data-i18n='refresh'>Refresh</button></div>"
+"    <div id='status-msg'></div>"
+"    <div id='dns-msg' class='hint'></div>"
+"    <div class='network-list' id='list'><div class='loading' data-i18n='scanning_networks'>Scanning...</div></div>"
+"    <div class='form-group'><label data-i18n='ssid_label'>Network name</label><input type='text' id='ssid' data-i18n-ph='ssid_ph' placeholder='Network name'></div>"
+"    <div class='form-group'><label data-i18n='password_label'>Password</label><input type='password' id='pwd' data-i18n-ph='pass_ph' placeholder='Password'></div>"
+"    <button class='btn' onclick='connect()' data-i18n='connect_btn'>CONNECT</button>"
 "  </div>"
+""
 "  <div id='tab-clients' class='tab-content'>"
-"    <div class='header-row'><h1>Clients</h1><button class='refresh-btn' onclick='loadClients()'>Refresh</button></div>"
-"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Signal is measured at this device, i.e. how well the client reaches the repeater. Per-client traffic volume is not tracked by the WiFi driver.</div>"
-"    <div id='client-list'><div class='loading'>Loading...</div></div>"
+"    <div class='header-row'><h1 data-i18n='tab_clients'>Clients</h1><button class='refresh-btn' onclick='loadClients()' data-i18n='refresh'>Refresh</button></div>"
+"    <div class='hint' data-i18n='clients_hint'></div>"
+"    <div id='client-list'><div class='loading' data-i18n='loading'>Loading...</div></div>"
 "  </div>"
+""
 "  <div id='tab-settings' class='tab-content'>"
-"    <h1 style='margin-bottom:15px'>Router Settings</h1>"
-"    <div class='form-group'><label>Current AP Password</label><input type='text' id='current-pass' readonly></div>"
-"    <div class='form-group'><label>New Password</label><input type='text' id='new-pass' placeholder='New password (min 8 chars)'></div>"
-"    <button class='btn' onclick='changePass()'>CHANGE PASSWORD</button>"
-"    <div id='settings-msg' style='margin-top:12px;font-size:13px;text-align:center'></div>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <h1 style='margin-bottom:6px'>DNS over HTTPS</h1>"
-"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Not every resolver is reachable from every network. If the status below says fallback, try another one.</div>"
-"    <div class='form-group'><label>Resolver URL</label><input type='text' id='doh-url' placeholder='https://223.5.5.5/dns-query'></div>"
-"    <button class='btn' onclick='saveDoh()'>SAVE RESOLVER</button>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <h1 style='margin-bottom:6px'>Radio</h1>"
-"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>HT40 is faster on clean spectrum. HT20 uses half the airtime and needs less signal margin, which can hold up better for distant clients. Worth testing from where you actually use it.</div>"
-"    <div class='form-group'><label>Channel width</label>"
-"      <select id='bw-sel' style='width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px'>"
-"        <option value='20'>20 MHz (HT20)</option>"
-"        <option value='40'>40 MHz (HT40)</option>"
-"      </select></div>"
-"    <button class='btn' onclick='saveRadio()'>APPLY</button>"
-"    <div id='radio-state' style='margin-top:10px;font-size:12px;color:#64748b'></div>"
-"    <div id='doh-state' style='margin-top:10px;font-size:12px;color:#64748b'></div>"
-"    <div id='doh-suggest' style='margin-top:8px;font-size:11px;color:#94a3b8'></div>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <h1 style='margin-bottom:6px'>Per-device DNS</h1>"
-"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Point one device at its own resolver, by MAC. Devices with no rule use the resolver above. DoH wants an <code>https://</code> URL; DoT and plain DNS want an IPv4 literal, <code>IP</code> or <code>IP:port</code>.</div>"
-"    <div id='dr-list'><div class='loading'>Loading...</div></div>"
-"    <div class='form-group'><label>Device MAC</label><input type='text' id='dr-mac' placeholder='aa:bb:cc:dd:ee:ff'></div>"
-"    <div class='form-group'><label>Protocol</label>"
-"      <select id='dr-mode' style='width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px'>"
-"        <option value='doh'>DoH (https:// URL)</option>"
-"        <option value='dot'>DoT (IP, default port 853)</option>"
-"        <option value='dns'>Plain DNS (IP, default port 53)</option>"
-"      </select></div>"
-"    <div class='form-group'><label>Resolver address</label><input type='text' id='dr-addr' placeholder='https://1.12.12.12/dns-query  or  223.5.5.5'></div>"
-"    <button class='btn' onclick='addDnsRule()'>SAVE RULE</button>"
-"    <button class='btn' style='background:#0f766e;margin-top:8px' onclick='runDnsTest()'>TEST ALL RESOLVERS</button>"
-"    <div id='dr-msg' style='margin-top:10px;font-size:12px'></div>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <h1 style='margin-bottom:6px'>Static leases</h1>"
-"    <div style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Bind a MAC to a fixed address. Must be outside the dynamic pool, or the allocator could hand the same address to someone else.</div>"
-"    <div id='lease-list'><div class='loading'>Loading...</div></div>"
-"    <div class='form-group'><label>MAC</label><input type='text' id='lease-mac' placeholder='aa:bb:cc:dd:ee:ff'></div>"
-"    <div class='form-group'><label>IP</label><input type='text' id='lease-ip' placeholder='192.168.4.150'></div>"
-"    <button class='btn' onclick='addLease()'>ADD LEASE</button>"
-"    <div id='lease-msg' style='margin-top:10px;font-size:12px'></div>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <h1 style='margin-bottom:6px'>Port forwarding</h1>"
-"    <div id='pm-note' style='font-size:11px;color:#94a3b8;margin-bottom:12px'>Open one port on the upstream side and send it to a client behind this AP.</div>"
-"    <div id='pm-list'><div class='loading'>Loading...</div></div>"
-"    <div class='form-group'><label>Protocol</label>"
-"      <select id='pm-proto' style='width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px'>"
-"        <option value='tcp'>TCP</option><option value='udp'>UDP</option></select></div>"
-"    <div class='form-group'><label>External port (on the upstream side)</label><input type='text' id='pm-mport' placeholder='8080'></div>"
-"    <div class='form-group'><label>Target client IP</label><input type='text' id='pm-daddr' placeholder='192.168.4.150'></div>"
-"    <div class='form-group'><label>Target port</label><input type='text' id='pm-dport' placeholder='80'></div>"
-"    <button class='btn' onclick='addPortmap()'>ADD RULE</button>"
-"    <div id='pm-msg' style='margin-top:10px;font-size:12px'></div>"
-"    <hr style='margin:24px 0;border-color:#e2e8f0'>"
-"    <button class='btn danger' onclick='resetAP()'>FACTORY RESET AP</button>"
-"    <div style='margin-top:8px;font-size:11px;color:#94a3b8'>Resets the AP password to a new random value</div>"
+"    <h1 data-i18n='tab_settings'>Settings</h1>"
+""
+"    <h2 data-i18n='sec_ap'>Access point</h2>"
+"    <div class='form-group'><label data-i18n='ap_name'>AP name (SSID)</label><input type='text' id='ssid-name'><div class='hint' style='margin:6px 0 0' data-i18n='ap_name_hint'></div></div>"
+"    <button class='btn' onclick='saveSsid()' data-i18n='save_name_btn'>SAVE NAME</button>"
+"    <div class='form-group' style='margin-top:14px'><label data-i18n='cur_ap_pass'>Current password</label><input type='text' id='current-pass' readonly></div>"
+"    <div class='form-group'><label data-i18n='new_ap_pass'>New password</label><input type='text' id='new-pass' data-i18n-ph='new_pass_ph' placeholder='at least 8 characters'></div>"
+"    <button class='btn' onclick='changePass()' data-i18n='change_pass_btn'>CHANGE PASSWORD</button>"
+"    <div style='margin-top:8px'><button class='btn danger small' onclick='resetAP()' data-i18n='reset_btn'>RESET TO RANDOM</button></div>"
+""
+"    <h2 data-i18n='sec_panel'>Web panel access</h2>"
+"    <div id='auth-state' class='hint'></div>"
+"    <div class='row form-group'><div><label data-i18n='user_label'>User</label><input type='text' id='web-user'></div></div>"
+"    <div class='form-group'><label data-i18n='panel_pass'>Password</label><input type='password' id='web-pass' data-i18n-ph='panel_pass_ph' placeholder='empty = no password'></div>"
+"    <button class='btn' onclick='savePanelAuth()' data-i18n='save_auth_btn'>SAVE</button>"
+""
+"    <h2 data-i18n='sec_doh'>Default resolver</h2>"
+"    <div class='hint' data-i18n='doh_hint'></div>"
+"    <div class='form-group'><label data-i18n='resolver_url'>Resolver address</label><input type='text' id='doh-url'></div>"
+"    <button class='btn' onclick='saveDoh()' data-i18n='save_resolver_btn'>SAVE RESOLVER</button>"
+"    <div id='doh-state' class='hint' style='margin-top:10px'></div>"
+"    <div id='doh-suggest' class='hint'></div>"
+""
+"    <h2 data-i18n='sec_radio'>Radio</h2>"
+"    <div id='radio-state' class='hint'></div>"
+"    <div class='form-group'><label data-i18n='channel_width'>Channel width</label>"
+"      <select id='bw-sel'><option value='40' data-i18n-opt='bw40'>40 MHz (HT40)</option><option value='20' data-i18n-opt='bw20'>20 MHz (HT20)</option></select></div>"
+"    <button class='btn' onclick='saveRadio()' data-i18n='apply_btn'>APPLY</button>"
+""
+"    <h2 data-i18n='sec_perdev'>Per-device DNS</h2>"
+"    <div class='hint' data-i18n='perdev_hint'></div>"
+"    <div class='form-group'><label data-i18n='device_mac'>Device MAC</label><input type='text' id='dr-mac' placeholder='aa:bb:cc:dd:ee:ff'></div>"
+"    <div class='form-group'><label data-i18n='protocol'>Protocol</label>"
+"      <select id='dr-mode'><option value='doh' data-i18n-opt='doh_opt'>DoH (https:// URL)</option><option value='dot' data-i18n-opt='dot_opt'>DoT (IP, port 853)</option><option value='dns' data-i18n-opt='dns_opt'>Plain DNS (IP, port 53)</option></select></div>"
+"    <div class='form-group'><label data-i18n='resolver_addr'>Resolver address</label><input type='text' id='dr-addr'></div>"
+"    <button class='btn' onclick='addDnsRule()' data-i18n='save_rule_btn'>SAVE RULE</button>"
+"    <div style='margin-top:8px'><button class='btn small' onclick='runDnsTest()' data-i18n='test_btn'>TEST ALL RESOLVERS</button></div>"
+"    <div id='dr-list' style='margin-top:12px'></div>"
+"    <div id='dr-msg' class='hint' style='margin-top:10px'></div>"
+""
+"    <h2 data-i18n='sec_leases'>Static leases</h2>"
+"    <div class='hint' data-i18n='leases_hint'></div>"
+"    <div class='row form-group'><div><label data-i18n='mac_label'>MAC</label><input type='text' id='lease-mac' placeholder='aa:bb:cc:dd:ee:ff'></div><div><label data-i18n='ip_label'>IP</label><input type='text' id='lease-ip' placeholder='192.168.4.150'></div></div>"
+"    <button class='btn' onclick='addLease()' data-i18n='add_lease_btn'>ADD LEASE</button>"
+"    <div id='lease-list' style='margin-top:12px'></div>"
+"    <div id='lease-msg' class='hint' style='margin-top:10px'></div>"
+""
+"    <h2 data-i18n='sec_fwd'>Port forwarding</h2>"
+"    <div class='hint' data-i18n='fwd_hint'></div>"
+"    <div id='pm-note' class='hint'></div>"
+"    <div class='row form-group'><div><label data-i18n='proto_label'>Protocol</label><select id='pm-proto'><option value='tcp'>TCP</option><option value='udp'>UDP</option></select></div><div><label data-i18n='ext_port'>Ext port</label><input type='text' id='pm-mport' placeholder='8080'></div></div>"
+"    <div class='row form-group'><div><label data-i18n='target_ip'>Target IP</label><input type='text' id='pm-daddr' placeholder='192.168.4.150'></div><div><label data-i18n='target_port'>Target port</label><input type='text' id='pm-dport' placeholder='80'></div></div>"
+"    <button class='btn' onclick='addPortmap()' data-i18n='add_fwd_btn'>ADD FORWARD</button>"
+"    <div id='pm-list' style='margin-top:12px'></div>"
+"    <div id='pm-msg' class='hint' style='margin-top:10px'></div>"
+""
+"    <h2 data-i18n='sec_about'>About</h2>"
+"    <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>"
+"    <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>"
+"    <div id='settings-msg' class='hint' style='margin-top:10px'></div>"
 "  </div>"
+""
 "  <div class='footer'>"
-"    <div class='footer-line'>ESP-IDF 6.1 &nbsp;|&nbsp; <a href='https://github.com/Svarkovsky/esp32-wifi-pocket' target='_blank'>based on esp32-wifi-pocket</a></div>"
-"    <div class='footer-line'>GPL v3</div>"
+"    <div data-i18n='footer_line'>EmbedWRT &middot; ESP32-S3 &middot; GPL v3</div>"
+"    <div><a href='https://github.com/Svarkovsky/esp32-wifi-pocket' target='_blank'>based on esp32-wifi-pocket</a></div>"
 "  </div>"
 "</div>"
 "<script>"
-"const lockSvg='<svg class=\"icon secure\" viewBox=\"0 0 24 24\"><path d=\"M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM9 6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9V6zm9 14H6V10h12v10zm-6-3c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2z\"/></svg>';"
-"const wifiSvg='<svg class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z\"/></svg>';"
-"let curSsid='';"
-"function switchTab(tab){"
-"  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));"
-"  document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));"
-"  event.target.classList.add('active');"
+"var I18N={"
+"en:{"
+" title:'EmbedWRT',subtitle:'WiFi NAT router &middot; DoH / DoT',"
+" tab_wifi:'WiFi',tab_clients:'Clients',tab_settings:'Settings',"
+" wifi_setup:'Upstream WiFi',refresh:'Refresh',scanning_networks:'Scanning...',"
+" ssid_label:'Network name',ssid_ph:'Network name',password_label:'Password',pass_ph:'Password',"
+" connect_btn:'CONNECT',"
+" checking:'Checking status...',connected_to:'Connected to:',not_connected:'Not connected',"
+" clients_hint:'Signal is measured at this device, i.e. how well the client reaches the repeater. Per-client traffic volume is not tracked by the WiFi driver.',"
+" sec_ap:'Access point',ap_name:'AP name (SSID)',ap_name_hint:'Changing this restarts WiFi: every client is dropped for a few seconds and the phone must rejoin. On iOS a new network name also means a new private MAC address, so MAC-based rules and leases must be re-added.',"
+" save_name_btn:'SAVE NAME',cur_ap_pass:'Current password',new_ap_pass:'New password',new_pass_ph:'at least 8 characters',"
+" change_pass_btn:'CHANGE PASSWORD',reset_btn:'RESET TO RANDOM',"
+" sec_panel:'Web panel access',user_label:'User',panel_pass:'Panel password',panel_pass_ph:'empty = no password (open)',"
+" save_auth_btn:'SAVE',auth_open:'No password set. This panel is reachable by anyone on the network.',auth_on:'Password is set.',"
+" sec_doh:'Default resolver',doh_hint:'Used by devices with no per-device rule below.',"
+" resolver_url:'Resolver address',save_resolver_btn:'SAVE RESOLVER',"
+" sec_radio:'Radio',channel_width:'Channel width',bw40:'40 MHz (HT40)',bw20:'20 MHz (HT20, better at range)',apply_btn:'APPLY',"
+" sec_perdev:'Per-device DNS',perdev_hint:'Leave empty to use the default resolver for every device.',"
+" device_mac:'Device MAC',protocol:'Protocol',doh_opt:'DoH (https:// URL)',dot_opt:'DoT (IP, port 853)',dns_opt:'Plain DNS (IP, port 53)',"
+" resolver_addr:'Resolver address',save_rule_btn:'SAVE RULE',test_btn:'TEST ALL RESOLVERS',"
+" sec_leases:'Static leases',leases_hint:'Pick an address outside the dynamic pool. iOS \"Private Wi-Fi Address\" rotates the MAC, which breaks MAC-based rules.',"
+" mac_label:'MAC',ip_label:'IP',add_lease_btn:'ADD LEASE',"
+" sec_fwd:'Port forwarding',fwd_hint:'Reachable from the upstream network only. The external address is what this device holds on the upstream side, and that address is itself behind the router NAT.',"
+" proto_label:'Protocol',ext_port:'Ext port',target_ip:'Target IP',target_port:'Target port',add_fwd_btn:'ADD FORWARD',"
+" sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
+" loading:'Loading...',no_clients:'No clients',no_rules:'No rules',no_leases:'No static leases',no_forwards:'No rules',no_networks:'No networks',scan_failed:'Scan failed',failed_load:'Failed to load',"
+" active:'(active)',delete:'delete',uptime:'up',unknown:'unknown',"
+" confirm_lease:'Remove the lease for',confirm_rule:'Remove the DNS rule for',confirm_fwd:'Remove',"
+" enter_both:'Fill in all fields',rejected:'Rejected',saved:'Saved.',applied:'Applied.',failed:'Failed',"
+" already_connected:'Already connected to',enter_ssid:'Enter a network name',"
+" pass_short:'Password must be at least 8 characters',pass_changed:'Password changed. You may need to reconnect.',pass_failed:'Failed to change password.',"
+" reset_confirm:'Reset the AP password to a new random value? You will need to reconnect.',reset_done:'AP password reset. The page will reload.',reset_failed:'Failed to reset password.',"
+" testing:'Testing each resolver with a real query; this takes a few seconds per entry...',test_failed:'Test request failed',"
+" doh_mode_doh:'DoH',doh_mode_plain:'plaintext fallback',doh_mode_none:'off',doh_mode_idle:'idle (no lookup yet)',doh_mode_clock:'waiting for the clock',"
+" pool_free:'Addresses outside',pool_in_use:'are handed out dynamically.',"
+" lease_note:'The client picks it up on its next request.',"
+" fwd_external:'Reachable from the upstream network at',"
+" fwd_no_ext:'No upstream address yet.',"
+" no_pass_set:'No password set',"
+" enable_btn:'ENABLE',disable_btn:'DISABLE'"
+"},"
+"zh:{"
+" title:'EmbedWRT',subtitle:'WiFi 中继路由器 &middot; DoH / DoT',"
+" tab_wifi:'WiFi',tab_clients:'客户端',tab_settings:'设置',"
+" wifi_setup:'上级 WiFi',refresh:'刷新',scanning_networks:'正在扫描...',"
+" ssid_label:'网络名称',ssid_ph:'网络名称',password_label:'密码',pass_ph:'密码',"
+" connect_btn:'连 接',"
+" checking:'正在检查状态...',connected_to:'已连接到：',not_connected:'未连接',"
+" clients_hint:'这里显示的是本机测到的信号，即客户端到中继的连接质量。WiFi 驱动不统计每个客户端的流量。',"
+" sec_ap:'热点',ap_name:'热点名称（SSID）',ap_name_hint:'修改会重启 WiFi：所有客户端会断开几秒，手机需要重新加入。iOS 上换网络名还会换一个新的随机 MAC，所以按 MAC 的规则和租约都需要重新添加。',"
+" save_name_btn:'保存名称',cur_ap_pass:'当前密码',new_ap_pass:'新密码',new_pass_ph:'至少 8 个字符',"
+" change_pass_btn:'修改密码',reset_btn:'重置为随机密码',"
+" sec_panel:'管理面板访问',user_label:'用户名',panel_pass:'面板密码',panel_pass_ph:'留空 = 不设密码（开放）',"
+" save_auth_btn:'保存',auth_open:'未设置密码。局域网内任何人都能打开并修改本面板。',auth_on:'已设置密码。',"
+" sec_doh:'默认解析器',doh_hint:'未单独指定规则的设备使用这一项。',"
+" resolver_url:'解析器地址',save_resolver_btn:'保存解析器',"
+" sec_radio:'射频',channel_width:'信道宽度',bw40:'40 MHz (HT40)',bw20:'20 MHz (HT20，远距离更好)',apply_btn:'应用',"
+" sec_perdev:'按设备指定 DNS',perdev_hint:'留空表示所有设备都用上面的默认解析器。',"
+" device_mac:'设备 MAC',protocol:'协议',doh_opt:'DoH（https:// 地址）',dot_opt:'DoT（IP，端口 853）',dns_opt:'明文 DNS（IP，端口 53）',"
+" resolver_addr:'解析器地址',save_rule_btn:'保存规则',test_btn:'测试所有解析器',"
+" sec_leases:'静态租约',leases_hint:'请选一个动态地址池之外的地址。iOS 的「私有 Wi-Fi 地址」会轮换 MAC，会让按 MAC 的规则失效。',"
+" mac_label:'MAC',ip_label:'IP',add_lease_btn:'添加租约',"
+" sec_fwd:'端口转发',fwd_hint:'只能从上级网络访问：外部地址是本机在上级网络的地址，而它本身还在路由器的 NAT 后面。',"
+" proto_label:'协议',ext_port:'外部端口',target_ip:'目标 IP',target_port:'目标端口',add_fwd_btn:'添加转发',"
+" sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
+" loading:'加载中...',no_clients:'暂无客户端',no_rules:'暂无规则',no_leases:'暂无静态租约',no_forwards:'暂无规则',no_networks:'未发现网络',scan_failed:'扫描失败',failed_load:'加载失败',"
+" active:'（当前）',delete:'删除',uptime:'在线',unknown:'未知',"
+" confirm_lease:'确定删除该设备的静态租约：',confirm_rule:'确定删除该设备的 DNS 规则：',confirm_fwd:'确定删除',"
+" enter_both:'请填写完整',rejected:'被拒绝',saved:'已保存。',applied:'已应用。',failed:'失败',"
+" already_connected:'已经连接到',enter_ssid:'请输入网络名称',"
+" pass_short:'密码至少需要 8 个字符',pass_changed:'密码已修改，可能需要重新连接。',pass_failed:'修改密码失败。',"
+" reset_confirm:'确定把热点密码重置为新的随机值？之后需要重新连接。',reset_done:'热点密码已重置，页面将重新加载。',reset_failed:'重置密码失败。',"
+" testing:'正在用真实查询逐个测试解析器，每项可能需要几秒...',test_failed:'测试请求失败',"
+" doh_mode_doh:'DoH 加密',doh_mode_plain:'降级为明文',doh_mode_none:'未启用',doh_mode_idle:'空闲（尚无查询）',doh_mode_clock:'等待对时',"
+" pool_free:'动态地址池之外的',pool_in_use:'会被动态分配。',"
+" lease_note:'客户端下次请求时生效。',"
+" fwd_external:'可从上级网络访问：',"
+" fwd_no_ext:'还没有上级地址。',"
+" no_pass_set:'未设置密码',"
+" enable_btn:'启用',disable_btn:'停用'"
+"}"
+"};"
+"var LANG='en';"
+"try{var sv=localStorage.getItem('embedwrt_lang');if(sv){LANG=sv}else if((navigator.language||'').toLowerCase().indexOf('zh')===0){LANG='zh'}}catch(e){}"
+"function t(k){var d=I18N[LANG]||I18N.en;var v=d[k];if(v===undefined){v=I18N.en[k]}return (v===undefined)?k:v}"
+"function toggleLang(){LANG=(LANG==='zh')?'en':'zh';try{localStorage.setItem('embedwrt_lang',LANG)}catch(e){}applyLang()}"
+"function applyLang(){"
+"  document.documentElement.lang=(LANG==='zh')?'zh-CN':'en';"
+"  var els=document.querySelectorAll('[data-i18n]');"
+"  for(var i=0;i<els.length;i++){els[i].innerHTML=t(els[i].getAttribute('data-i18n'))}"
+"  var ph=document.querySelectorAll('[data-i18n-ph]');"
+"  for(var j=0;j<ph.length;j++){ph[j].placeholder=t(ph[j].getAttribute('data-i18n-ph'))}"
+"  var op=document.querySelectorAll('[data-i18n-opt]');"
+"  for(var k=0;k<op.length;k++){op[k].textContent=t(op[k].getAttribute('data-i18n-opt'))}"
+"  document.getElementById('lang-btn').textContent=(LANG==='zh')?'EN':'中文';"
+"  refreshActiveTab();"
+"}"
+"var DOH_STATE={doh:'doh_mode_doh',plain:'doh_mode_plain',off:'doh_mode_none',idle:'doh_mode_idle',clock:'doh_mode_clock'};"
+"function dohText(m){return t(DOH_STATE[m]||'doh_mode_plain')}"
+"function refreshActiveTab(){"
+"  if(document.getElementById('tab-wifi').classList.contains('active')){init()}"
+"  else if(document.getElementById('tab-clients').classList.contains('active')){loadClients()}"
+"  else{loadSettings()}"
+"}"
+"function switchTab(tab,ev){"
+"  var tabs=document.querySelectorAll('.tab'),cs=document.querySelectorAll('.tab-content');"
+"  for(var i=0;i<tabs.length;i++){tabs[i].classList.remove('active')}"
+"  for(var j=0;j<cs.length;j++){cs[j].classList.remove('active')}"
+"  if(ev&&ev.target){ev.target.classList.add('active')}"
 "  document.getElementById('tab-'+tab).classList.add('active');"
-"  if(tab==='settings'){ loadSettings(); loadDoh(); loadRadio(); loadDnsRules(); loadLeases(); loadPortmaps(); }"
-"  if(tab==='clients'){ loadClients(); }"
+"  refreshActiveTab();"
 "}"
-"function bars(rssi){"
-"  if(rssi>=-50) return '▂▄▆█'; if(rssi>=-60) return '▂▄▆_';"
-"  if(rssi>=-70) return '▂▄__'; if(rssi>=-80) return '▂___'; return '____';"
-"}"
-"function fmtUp(s){"
-"  if(!s) return '-';"
-"  if(s<60) return s+'s';"
-"  if(s<3600) return Math.floor(s/60)+'m'+(s%60)+'s';"
-"  return Math.floor(s/3600)+'h'+Math.floor((s%3600)/60)+'m';"
-"}"
-"function loadClients(){"
-"  const box=document.getElementById('client-list');"
-"  box.innerHTML='<div class=\"loading\">Loading...</div>';"
-"  fetch('/api/clients').then(r=>r.json()).then(list=>{"
-"    if(!list.length) { box.innerHTML='<div class=\"loading\">No clients connected</div>'; return; }"
-"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
-"    list.forEach(c=>{"
-"      const name = c.host ? c.host : '(no hostname)';"
-"      const col = c.rssi>=-60 ? '#15803d' : (c.rssi>=-70 ? '#b45309' : '#b91c1c');"
-"      h += '<div class=\"network-item\" style=\"display:block\">'"
-"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
-"         + '<span class=\"net-info\"><b>'+name+'</b></span>'"
-"         + '<span style=\"color:'+col+';font-family:monospace;font-size:13px\">'+bars(c.rssi)+' '+c.rssi+' dBm</span>'"
-"         + '</div>'"
-"         + '<div style=\"font-size:11px;color:#64748b;margin-top:4px;font-family:monospace\">'"
-"         + c.ip + ' &middot; ' + c.mac + ' &middot; up ' + fmtUp(c.uptime)"
-"         + '</div></div>';"
-"    });"
-"    box.innerHTML = h + '</div>';"
-"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
-"}"
-"function loadDnsRules(){"
-"  const box=document.getElementById('dr-list');"
-"  fetch('/api/dnsrules').then(r=>r.json()).then(d=>{"
-"    if(!d.rules.length){ box.innerHTML='<div class=\"loading\">No per-device rules</div>'; return; }"
-"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
-"    d.rules.forEach(r=>{"
-"      h += '<div class=\"network-item\" style=\"display:block\">'"
-"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
-"         + '<span style=\"font-family:monospace;font-size:12px\"><b>'+r.mode+'</b> '+r.addr+'<br><span style=\"color:#64748b\">'+r.mac+'</span></span>'"
-"         + '<button class=\"refresh-btn\" onclick=\"delDnsRule(\\''+r.mac+'\\')\">delete</button>'"
-"         + '</div></div>';"
-"    });"
-"    box.innerHTML = h + '</div>';"
-"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
-"}"
-"function addDnsRule(){"
-"  const mac=document.getElementById('dr-mac').value.trim();"
-"  const mode=document.getElementById('dr-mode').value;"
-"  const addr=document.getElementById('dr-addr').value.trim();"
-"  const m=document.getElementById('dr-msg');"
-"  if(!mac||!addr){ m.innerHTML='<span style=\"color:#b45309\">Enter both MAC and address</span>'; return; }"
-"  fetch('/dnsrule/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&mode='+mode+'&addr='+encodeURIComponent(addr)})"
-"  .then(r=>r.text().then(t=>{"
-"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Rule saved.</span>'"
-"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
-"    if(r.ok){ document.getElementById('dr-mac').value=''; document.getElementById('dr-addr').value=''; }"
-"    loadDnsRules();"
-"  }));"
-"}"
-"function delDnsRule(mac){"
-"  if(!confirm('Remove the DNS rule for '+mac+'?')) return;"
-"  fetch('/dnsrule/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
-"  .then(()=>loadDnsRules());"
-"}"
-"function runDnsTest(){"
-"  const m=document.getElementById('dr-msg');"
-"  m.innerHTML='<span style=\"color:#64748b\">Testing each resolver with a real query, this can take ~10s per DoT/DoH entry...</span>';"
-"  fetch('/api/dnstest').then(r=>r.json()).then(d=>{"
-"    let h='<div style=\"font-family:monospace;font-size:11px;line-height:1.6\">';"
-"    h += '<b>default</b> (doh) '+d.default.addr+'<br>&nbsp;&nbsp;'+d.default.result+'<br>';"
-"    d.rules.forEach(r=>{ h += '<b>'+r.mac+'</b> ('+r.mode+') '+r.addr+'<br>&nbsp;&nbsp;'+r.result+'<br>'; });"
-"    m.innerHTML = h + '</div>';"
-"  }).catch(e=>m.innerHTML='<span style=\"color:#b91c1c\">Test request failed</span>');"
-"}"
-"function loadPortmaps(){"
-"  const box=document.getElementById('pm-list');"
-"  fetch('/api/portmaps').then(r=>r.json()).then(d=>{"
-"    document.getElementById('pm-note').innerHTML = d.external"
-"      ? 'Reachable from the upstream network at <b>'+d.external+'</b>. Not reachable from the internet unless the upstream router also forwards it here.'"
-"      : 'No upstream address yet.';"
-"    if(!d.rules.length){ box.innerHTML='<div class=\"loading\">No rules</div>'; return; }"
-"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
-"    d.rules.forEach(r=>{"
-"      h += '<div class=\"network-item\" style=\"display:block\">'"
-"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
-"         + '<span style=\"font-family:monospace;font-size:13px\"><b>'+r.proto+' '+r.mport+'</b> &rarr; '+r.daddr+':'+r.dport+'</span>'"
-"         + '<button class=\"refresh-btn\" onclick=\"delPortmap(\\''+r.proto+'\\','+r.mport+')\">delete</button>'"
-"         + '</div></div>';"
-"    });"
-"    box.innerHTML = h + '</div>';"
-"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
-"}"
-"function addPortmap(){"
-"  const p=document.getElementById('pm-proto').value;"
-"  const mp=document.getElementById('pm-mport').value.trim();"
-"  const da=document.getElementById('pm-daddr').value.trim();"
-"  const dp=document.getElementById('pm-dport').value.trim();"
-"  const m=document.getElementById('pm-msg');"
-"  if(!mp||!da||!dp){ m.innerHTML='<span style=\"color:#b45309\">Fill in port, target IP and target port</span>'; return; }"
-"  fetch('/portmap/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+p+'&mport='+encodeURIComponent(mp)+'&daddr='+encodeURIComponent(da)+'&dport='+encodeURIComponent(dp)})"
-"  .then(r=>r.text().then(t=>{"
-"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Rule added and active.</span>'"
-"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
-"    if(r.ok){ document.getElementById('pm-mport').value=''; document.getElementById('pm-daddr').value=''; document.getElementById('pm-dport').value=''; }"
-"    loadPortmaps();"
-"  }));"
-"}"
-"function delPortmap(proto,mport){"
-"  if(!confirm('Remove '+proto+' '+mport+'?')) return;"
-"  fetch('/portmap/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+proto+'&mport='+mport})"
-"  .then(()=>loadPortmaps());"
-"}"
-"function loadLeases(){"
-"  const box=document.getElementById('lease-list');"
-"  fetch('/api/leases').then(r=>r.json()).then(d=>{"
-"    const pool = d.pool_known ? ('Free range: <b>'+d.pool_first+' - '+d.pool_last+'</b> is in use by the pool; pick something outside it, e.g. 192.168.4.150') : 'Pool bounds unknown; adding leases is disabled.';"
-"    if(!d.leases.length){ box.innerHTML='<div class=\"loading\">No static leases</div>'; document.getElementById('lease-msg').innerHTML=pool; return; }"
-"    let h='<div class=\"network-list\" style=\"max-height:none\">';"
-"    d.leases.forEach(l=>{"
-"      h += '<div class=\"network-item\" style=\"display:block\">'"
-"         + '<div style=\"display:flex;justify-content:space-between;align-items:center\">'"
-"         + '<span style=\"font-family:monospace;font-size:13px\"><b>'+l.ip+'</b> &rarr; '+l.mac+'</span>'"
-"         + '<button class=\"refresh-btn\" onclick=\"delLease(\\''+l.mac+'\\')\">delete</button>'"
-"         + '</div></div>';"
-"    });"
-"    box.innerHTML = h + '</div>';"
-"    document.getElementById('lease-msg').innerHTML=pool;"
-"  }).catch(()=>box.innerHTML='<div class=\"loading\">Failed to load</div>');"
-"}"
-"function addLease(){"
-"  const mac=document.getElementById('lease-mac').value.trim();"
-"  const ip=document.getElementById('lease-ip').value.trim();"
-"  const m=document.getElementById('lease-msg');"
-"  if(!mac||!ip) { m.innerHTML='<span style=\"color:#b45309\">Enter both MAC and IP</span>'; return; }"
-"  fetch('/lease/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&ip='+encodeURIComponent(ip)})"
-"  .then(r=>r.text().then(t=>{"
-"    m.innerHTML = r.ok ? '<span style=\"color:#15803d\">Lease added. The client picks it up on its next request.</span>'"
-"                       : '<span style=\"color:#b91c1c\">Rejected: '+t+'</span>';"
-"    if(r.ok){ document.getElementById('lease-mac').value=''; document.getElementById('lease-ip').value=''; }"
-"    loadLeases();"
-"  }));"
-"}"
-"function delLease(mac){"
-"  if(!confirm('Remove the lease for '+mac+'?')) return;"
-"  fetch('/lease/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
-"  .then(()=>loadLeases());"
-"}"
-"function loadRadio(){"
-"  fetch('/api/radio').then(r=>r.json()).then(d=>{"
-"    document.getElementById('bw-sel').value = (d.bw === 'HT20') ? '20' : '40';"
-"    document.getElementById('radio-state').innerHTML ="
-"      'Country <b>'+d.country+'</b> &middot; channels '+d.ch_min+'-'+d.ch_max"
-"      + ' &middot; TX <b>'+d.txpower_dbm+' dBm</b>';"
-"  }).catch(()=>{});"
-"}"
-"function saveRadio(){"
-"  const bw=document.getElementById('bw-sel').value;"
-"  const btn=event.target; btn.innerText='APPLYING...'; btn.style.background='#94a3b8';"
-"  fetch('/setradio',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'bw='+bw})"
-"  .then(r=>{"
-"    if(r.ok){ document.getElementById('settings-msg').innerHTML='<div class=\"info-box\">Channel width set to '+bw+' MHz.</div>'; }"
-"    else { document.getElementById('settings-msg').innerHTML='<div class=\"info-box warn\">Rejected.</div>'; }"
-"  })"
-"  .finally(()=>{btn.innerText='APPLY'; btn.style.background='#3b82f6'; loadRadio();});"
-"}"
-"function loadDoh(){"
-"  fetch('/api/dohurl').then(r=>r.json()).then(d=>{"
-"    document.getElementById('doh-url').value = d.url;"
-"    const s=document.getElementById('doh-state');"
-"    const good = d.mode === 'doh';"
-"    s.innerHTML = 'Status: <b>' + d.mode + '</b>';"
-"    s.style.color = good ? '#15803d' : '#b45309';"
-"    document.getElementById('doh-suggest').innerHTML ="
-"      'Reachable from CN: <b>223.5.5.5</b>, <b>1.12.12.12</b>, <b>doh.pub</b>' +"
-"      '<br>Usually blocked: 1.1.1.1, 8.8.8.8, 9.9.9.9';"
-"  }).catch(()=>{});"
-"}"
-"function saveDoh(){"
-"  const u=document.getElementById('doh-url').value.trim();"
-"  if(!u.startsWith('https://')) return alert('URL must start with https://');"
-"  const btn=event.target; btn.innerText='SAVING...'; btn.style.background='#94a3b8';"
-"  fetch('/setdohurl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)})"
-"  .then(r=>{"
-"    if(r.ok){ document.getElementById('settings-msg').innerHTML='<div class=\"info-box\">Resolver saved. New lookups will use it.</div>'; }"
-"    else { document.getElementById('settings-msg').innerHTML='<div class=\"info-box warn\">Rejected: must be a valid https:// URL.</div>'; }"
-"  })"
-"  .finally(()=>{btn.innerText='SAVE RESOLVER'; btn.style.background='#3b82f6'; loadDoh();});"
-"}"
+"function loadSettings(){loadSsid();loadAuth();loadDoh();loadRadio();loadLeases();loadDnsRules();loadPortmaps();loadHostname()}"
 "function init(){"
-"  fetch('/status').then(r=>r.json()).then(d=>{"
-"    curSsid = d.ssid;"
-"    const msg = document.getElementById('status-msg');"
-"    if(d.status === 'connected') {"
-"      msg.innerHTML = 'Connected to: <b>' + d.ssid + '</b>';"
-"      msg.style.color = '#15803d'; msg.style.background = '#f0fdf4';"
-"    } else {"
-"      msg.innerHTML = 'Not connected';"
-"      msg.style.color = '#b91c1c'; msg.style.background = '#fef2f2';"
+"  fetch('/status').then(function(r){return r.json()}).then(function(d){"
+"    var msg=document.getElementById('status-msg');"
+"    if(d.status==='connected'){"
+"      msg.innerHTML=t('connected_to')+' <b>'+d.ssid+'</b>';"
+"      msg.style.color='#15803d';msg.style.background='#f0fdf4';"
+"    }else{"
+"      msg.innerHTML=t('not_connected');"
+"      msg.style.color='#b91c1c';msg.style.background='#fef2f2';"
 "    }"
-"    const dm = document.getElementById('dns-msg');"
-"    dm.innerHTML = 'DNS: ' + d.doh + (d.doh === 'doh' ? ' ✓' : '');"
+"    var dm=document.getElementById('dns-msg');"
+"    var mode=d.doh||'';"
+"    dm.innerHTML='DNS: '+dohText(mode)+(mode==='doh'?' ✓':'');"
 "    scan();"
-"  });"
+"  }).catch(function(){});"
 "}"
+"var lockSvg='<svg class=\"icon secure\" viewBox=\"0 0 24 24\"><path d=\"M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM9 6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9V6zm9 14H6V10h12v10zm-6-3c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2z\"/></svg>';"
+"var wifiSvg='<svg class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z\"/></svg>';"
+"var curSsid='';"
 "function scan(){"
-"  const lst=document.getElementById('list'); lst.innerHTML='<div class=\"loading\">Scanning...</div>';"
-"  fetch('/scan').then(r=>r.json()).then(data=>{"
+"  var lst=document.getElementById('list');lst.innerHTML='<div class=\"loading\">'+t('scanning_networks')+'</div>';"
+"  fetch('/scan').then(function(r){return r.json()}).then(function(data){"
 "    lst.innerHTML='';"
-"    if(data.length===0) return lst.innerHTML='<div class=\"loading\">No networks</div>';"
-"    data.forEach(net=>{"
-"      const div=document.createElement('div'); div.className='network-item';"
-"      if(net.ssid === curSsid) { div.style.background='#f0fdf4'; div.style.borderLeft='3px solid #22c55e'; }"
-"      div.onclick=()=>document.getElementById('ssid').value=net.ssid;"
-"      div.innerHTML=`<div class='net-info'>${net.ssid} ${net.ssid===curSsid?'<b>(Active)</b>':''}</div><div class='net-icons'>${net.sec?lockSvg:''}${wifiSvg}</div>`;"
+"    if(!data.length){lst.innerHTML='<div class=\"loading\">'+t('no_networks')+'</div>';return}"
+"    data.forEach(function(net){"
+"      var div=document.createElement('div');div.className='network-item';"
+"      if(net.ssid===curSsid){div.style.background='#f0fdf4';div.style.borderLeft='3px solid #22c55e'}"
+"      div.onclick=function(){document.getElementById('ssid').value=net.ssid};"
+"      div.innerHTML=\"<div class='net-info'>\"+net.ssid+(net.ssid===curSsid?' <b>'+t('active')+'</b>':'')+\"</div><div class='net-icons'>\"+(net.sec?lockSvg:'')+wifiSvg+\"</div>\";"
 "      lst.appendChild(div);"
 "    });"
-"  }).catch(()=>lst.innerHTML='<div class=\"loading\">Scan failed</div>');"
+"  }).catch(function(){lst.innerHTML='<div class=\"loading\">'+t('scan_failed')+'</div>'});"
 "}"
 "function connect(){"
-"  const s=document.getElementById('ssid').value;"
-"  const p=document.getElementById('pwd').value;"
-"  if(!s) return alert('Enter SSID');"
-"  if(s === curSsid) return alert('Already connected to ' + s + '!');"
-"  const btn=event.target; btn.innerText='CONNECTING...'; btn.style.background='#94a3b8';"
+"  var s=document.getElementById('ssid').value,p=document.getElementById('pwd').value;"
+"  if(!s){alert(t('enter_ssid'));return}"
+"  if(s===curSsid){alert(t('already_connected')+' '+s);return}"
+"  var btn=event.target;btn.innerText='...';btn.style.background='#94a3b8';"
 "  fetch('/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)})"
-"  .then(()=>alert('Settings saved! You will get internet access shortly.'))"
-"  .finally(()=>{btn.innerText='CONNECT'; btn.style.background='#3b82f6'; setTimeout(init, 3000);});"
+"  .then(function(){alert(t('saved')+' ')})"
+"  .finally(function(){btn.innerText=t('connect_btn');btn.style.background='#3b82f6';setTimeout(init,3000)});"
 "}"
-"function loadSettings(){"
-"  fetch('/api/appass').then(r=>r.json()).then(d=>{"
-"    document.getElementById('current-pass').value = d.password || 'Not set';"
-"  });"
+"function loadClients(){"
+"  var box=document.getElementById('client-list');"
+"  fetch('/api/clients').then(function(r){return r.json()}).then(function(d){"
+"    if(!d.length){box.innerHTML='<div class=\"loading\">'+t('no_clients')+'</div>';return}"
+"    var h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.forEach(function(c){"
+"      var r=c.rssi,col=(r>-60)?'#15803d':((r>-70)?'#b45309':'#b91c1c');"
+"      h+=\"<div class='network-item' style='cursor:default'><div style='width:100%'>\""
+"        +\"<div style='display:flex;justify-content:space-between;align-items:center'>\""
+"        +\"<span class='mono' style='font-size:12px'>\"+c.mac+\"</span>\""
+"        +\"<span style='color:\"+col+\";font-weight:700;font-size:13px'>\"+r+\" dBm</span></div>\""
+"        +\"<div style='font-size:12px;color:#475569;margin-top:4px'>\"+c.ip"
+"        +(c.host?(\" &middot; \"+c.host):\"\")+\" &middot; \"+t('uptime')+\" \"+Math.floor(c.uptime/60)+\"m</div>\""
+"        +\"</div></div>\";"
+"    });"
+"    box.innerHTML=h+'</div>';"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function loadSsid(){fetch('/api/ssid').then(function(r){return r.json()}).then(function(d){document.getElementById('ssid-name').value=d.ssid}).catch(function(){})}"
+"function saveSsid(){"
+"  var v=document.getElementById('ssid-name').value.trim();"
+"  if(!v){alert(t('enter_both'));return}"
+"  var btn=event.target;btn.innerText='...';"
+"  fetch('/setssid',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(v)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    document.getElementById('settings-msg').innerHTML=r.ok?t('saved'):(t('rejected')+': '+x);"
+"  })})"
+"  .finally(function(){btn.innerText=t('save_name_btn')});"
+"}"
+"function loadAuth(){"
+"  fetch('/api/webauth').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('web-user').value=d.user;"
+"    document.getElementById('auth-state').innerHTML=d.enabled?t('auth_on'):('<b>'+t('auth_open')+'</b>');"
+"    document.getElementById('auth-state').style.color=d.enabled?'#15803d':'#b91c1c';"
+"  }).catch(function(){});"
+"}"
+"function savePanelAuth(){"
+"  var u=document.getElementById('web-user').value.trim(),p=document.getElementById('web-pass').value;"
+"  var m=document.getElementById('settings-msg');"
+"  fetch('/setwebauth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'user='+encodeURIComponent(u)+'&pass='+encodeURIComponent(p)})"
+"  .then(function(r){return r.text().then(function(x){m.innerHTML=r.ok?t('saved'):(t('rejected')+': '+x)});"
+"  }).finally(function(){document.getElementById('web-pass').value='';loadAuth()});"
+"}"
+"function loadDoh(){"
+"  fetch('/api/dohurl').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('doh-url').value=d.url;"
+"    var s=document.getElementById('doh-state');"
+"    s.innerHTML=t('sec_doh')+': <b>'+dohText(d.mode)+'</b>';"
+"    s.style.color=(d.mode==='doh')?'#15803d':((d.mode==='idle')?'#64748b':'#b45309');"
+"    document.getElementById('doh-suggest').innerHTML=\"CN: <b>223.5.5.5</b> / <b>dns.alidns.com</b> / <b>1.12.12.12</b> / <b>doh.pub</b><br>1.1.1.1 / 8.8.8.8 / 9.9.9.9\";"
+"  }).catch(function(){});"
+"}"
+"function saveDoh(){"
+"  var u=document.getElementById('doh-url').value.trim();"
+"  if(u.indexOf('https://')!==0){alert('https://');return}"
+"  var btn=event.target;btn.innerText='...';"
+"  fetch('/setdohurl',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(u)})"
+"  .then(function(r){document.getElementById('settings-msg').innerHTML=r.ok?t('saved'):t('rejected')})"
+"  .finally(function(){btn.innerText=t('save_resolver_btn');loadDoh()});"
+"}"
+"function loadRadio(){"
+"  fetch('/api/radio').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('bw-sel').value=(d.bw==='HT20')?'20':'40';"
+"    document.getElementById('radio-state').innerHTML=d.country+' &middot; CH '+d.ch_min+'-'+d.ch_max+' &middot; <b>'+d.txpower_dbm+' dBm</b>';"
+"  }).catch(function(){});"
+"}"
+"function saveRadio(){"
+"  var bw=document.getElementById('bw-sel').value;"
+"  var btn=event.target;btn.innerText='...';"
+"  fetch('/setradio',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'bw='+bw})"
+"  .then(function(r){document.getElementById('settings-msg').innerHTML=r.ok?t('applied'):t('failed')})"
+"  .finally(function(){btn.innerText=t('apply_btn');loadRadio()});"
+"}"
+"function loadDnsRules(){"
+"  var box=document.getElementById('dr-list');"
+"  fetch('/api/dnsrules').then(function(r){return r.json()}).then(function(d){"
+"    if(!d.rules.length){box.innerHTML='<div class=\"loading\">'+t('no_rules')+'</div>';return}"
+"    var h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.rules.forEach(function(r){"
+"      h+=\"<div class='network-item' style='cursor:default'><div style='display:flex;justify-content:space-between;align-items:center;width:100%'>\""
+"        +\"<span class='mono' style='font-size:11px'><b>\"+r.mode+\"</b> \"+r.addr+\"<br><span style='color:#64748b'>\"+r.mac+\"</span></span>\""
+"        +\"<button class='refresh-btn' onclick='delDnsRule(\\\"\"+r.mac+\"\\\")'>\"+t('delete')+\"</button></div></div>\";"
+"    });"
+"    box.innerHTML=h+'</div>';"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function addDnsRule(){"
+"  var mac=document.getElementById('dr-mac').value.trim(),mode=document.getElementById('dr-mode').value,addr=document.getElementById('dr-addr').value.trim();"
+"  var m=document.getElementById('dr-msg');"
+"  if(!mac||!addr){m.innerHTML='<span style=\"color:#b45309\">'+t('enter_both')+'</span>';return}"
+"  fetch('/dnsrule/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&mode='+mode+'&addr='+encodeURIComponent(addr)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>'):('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"    if(r.ok){document.getElementById('dr-mac').value='';document.getElementById('dr-addr').value=''}"
+"    loadDnsRules();"
+"  })});"
+"}"
+"function delDnsRule(mac){"
+"  if(!confirm(t('confirm_rule')+' '+mac+' ?')){return}"
+"  fetch('/dnsrule/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)}).then(function(){loadDnsRules()});"
+"}"
+"function runDnsTest(){"
+"  var m=document.getElementById('dr-msg');"
+"  m.innerHTML='<span style=\"color:#64748b\">'+t('testing')+'</span>';"
+"  fetch('/api/dnstest').then(function(r){return r.json()}).then(function(d){"
+"    var h=\"<div class='testout'><b>default</b> \"+d.default.mode+' '+d.default.addr+'<br>&nbsp;&nbsp;'+d.default.result+'<br>';"
+"    d.rules.forEach(function(r){h+='<b>'+r.mac+'</b> '+r.mode+' '+r.addr+'<br>&nbsp;&nbsp;'+r.result+'<br>'});"
+"    m.innerHTML=h+'</div>';"
+"  }).catch(function(){m.innerHTML='<span style=\"color:#b91c1c\">'+t('test_failed')+'</span>'});"
+"}"
+"function loadLeases(){"
+"  var box=document.getElementById('lease-list');"
+"  fetch('/api/leases').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('lease-msg').innerHTML=d.pool_known?(t('pool_free')+' <b>'+d.pool_first+'-'+d.pool_last+'</b> '+t('pool_in_use')):'';"
+"    if(!d.leases.length){box.innerHTML='<div class=\"loading\">'+t('no_leases')+'</div>';return}"
+"    var h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.leases.forEach(function(l){"
+"      h+=\"<div class='network-item' style='cursor:default'><div style='display:flex;justify-content:space-between;align-items:center;width:100%'>\""
+"        +\"<span class='mono' style='font-size:12px'><b>\"+l.ip+\"</b> &larr; \"+l.mac+\"</span>\""
+"        +\"<button class='refresh-btn' onclick='delLease(\\\"\"+l.mac+\"\\\")'>\"+t('delete')+\"</button></div></div>\";"
+"    });"
+"    box.innerHTML=h+'</div>';"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function addLease(){"
+"  var mac=document.getElementById('lease-mac').value.trim(),ip=document.getElementById('lease-ip').value.trim();"
+"  var m=document.getElementById('lease-msg');"
+"  if(!mac||!ip){m.innerHTML='<span style=\"color:#b45309\">'+t('enter_both')+'</span>';return}"
+"  fetch('/lease/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)+'&ip='+encodeURIComponent(ip)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+' '+t('lease_note')+'</span>'):('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"    if(r.ok){document.getElementById('lease-mac').value='';document.getElementById('lease-ip').value=''}"
+"    loadLeases();"
+"  })});"
+"}"
+"function delLease(mac){"
+"  if(!confirm(t('confirm_lease')+' '+mac+' ?')){return}"
+"  fetch('/lease/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)}).then(function(){loadLeases()});"
+"}"
+"function loadPortmaps(){"
+"  var box=document.getElementById('pm-list');"
+"  fetch('/api/portmaps').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('pm-note').innerHTML=d.external?(t('fwd_external')+' <b>'+d.external+'</b>'):t('fwd_no_ext');"
+"    if(!d.rules.length){box.innerHTML='<div class=\"loading\">'+t('no_forwards')+'</div>';return}"
+"    var h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.rules.forEach(function(r){"
+"      h+=\"<div class='network-item' style='cursor:default'><div style='display:flex;justify-content:space-between;align-items:center;width:100%'>\""
+"        +\"<span class='mono' style='font-size:12px'><b>\"+r.proto+' '+r.mport+\"</b> &rarr; \"+r.daddr+':'+r.dport+\"</span>\""
+"        +\"<button class='refresh-btn' onclick='delPortmap(\\\"\"+r.proto+\"\\\",\"+r.mport+\")'>\"+t('delete')+\"</button></div></div>\";"
+"    });"
+"    box.innerHTML=h+'</div>';"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function addPortmap(){"
+"  var p=document.getElementById('pm-proto').value,mp=document.getElementById('pm-mport').value.trim();"
+"  var da=document.getElementById('pm-daddr').value.trim(),dp=document.getElementById('pm-dport').value.trim();"
+"  var m=document.getElementById('pm-msg');"
+"  if(!mp||!da||!dp){m.innerHTML='<span style=\"color:#b45309\">'+t('enter_both')+'</span>';return}"
+"  fetch('/portmap/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+p+'&mport='+encodeURIComponent(mp)+'&daddr='+encodeURIComponent(da)+'&dport='+encodeURIComponent(dp)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>'):('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"    if(r.ok){document.getElementById('pm-mport').value='';document.getElementById('pm-daddr').value='';document.getElementById('pm-dport').value=''}"
+"    loadPortmaps();"
+"  })});"
+"}"
+"function delPortmap(proto,mport){"
+"  if(!confirm(t('confirm_fwd')+' '+proto+' '+mport+' ?')){return}"
+"  fetch('/portmap/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+proto+'&mport='+mport}).then(function(){loadPortmaps()});"
+"}"
+"function loadHostname(){fetch('/api/hostname').then(function(r){return r.json()}).then(function(d){document.getElementById('mdns-name').value=d.hostname}).catch(function(){})}"
+"function saveHostname(){"
+"  var v=document.getElementById('mdns-name').value.trim();"
+"  if(!v){alert(t('enter_both'));return}"
+"  var btn=event.target;btn.innerText='...';"
+"  fetch('/sethostname',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hostname='+encodeURIComponent(v)})"
+"  .then(function(r){return r.text().then(function(x){document.getElementById('settings-msg').innerHTML=r.ok?t('saved'):(t('rejected')+': '+x)})})"
+"  .finally(function(){btn.innerText=t('save_mdns_btn')});"
 "}"
 "function changePass(){"
-"  const pass = document.getElementById('new-pass').value;"
-"  if(pass.length < 8) return alert('Password must be at least 8 characters');"
-"  const btn=event.target; btn.innerText='CHANGING...'; btn.style.background='#94a3b8';"
+"  var pass=document.getElementById('new-pass').value;"
+"  if(pass.length<8){alert(t('pass_short'));return}"
+"  var btn=event.target;btn.innerText='...';"
 "  fetch('/setpass',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'pass='+encodeURIComponent(pass)})"
-"  .then(r=>{"
-"    if(r.ok){"
-"      document.getElementById('settings-msg').innerHTML='<div class=\"info-box\">Password changed! You may need to reconnect.</div>';"
-"      document.getElementById('current-pass').value = pass;"
-"      document.getElementById('new-pass').value = '';"
-"    } else {"
-"      document.getElementById('settings-msg').innerHTML='<div class=\"info-box warn\">Failed to change password.</div>';"
-"    }"
-"  })"
-"  .finally(()=>{btn.innerText='CHANGE PASSWORD'; btn.style.background='#3b82f6';});"
+"  .then(function(r){document.getElementById('settings-msg').innerHTML=r.ok?t('pass_changed'):t('pass_failed')})"
+"  .finally(function(){btn.innerText=t('change_pass_btn')});"
 "}"
 "function resetAP(){"
-"  if(!confirm('Reset the AP password to a new random value? You will need to reconnect.')) return;"
-"  fetch('/resetpass',{method:'POST'}).then(r=>{"
-"    if(r.ok){"
-"      alert('AP password reset. The page will reload.');"
-"      location.reload();"
-"    } else {"
-"      alert('Failed to reset password.');"
-"    }"
+"  if(!confirm(t('reset_confirm'))){return}"
+"  fetch('/resetpass',{method:'POST'}).then(function(r){"
+"    if(r.ok){alert(t('reset_done'));location.reload()}else{alert(t('reset_failed'))}"
 "  });"
 "}"
-"window.onload=init;"
+""
+"applyLang();"
+"fetch('/api/appass').then(function(r){return r.json()}).then(function(d){document.getElementById('current-pass').value=d.password||t('no_pass_set')}).catch(function(){});"
 "</script></body></html>";
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -1274,6 +1562,138 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
 static const char *mode_name(uint8_t mode)
 {
     return (mode == DNS_MODE_DOT) ? "dot" : (mode == DNS_MODE_PLAIN ? "dns" : "doh");
+}
+
+static esp_err_t ssid_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "ssid", ap_ssid_full);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_ssid_post_handler(httpd_req_t *req)
+{
+    char buf[192] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw[128] = {0};
+    if (httpd_query_key_value(buf, "ssid", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
+        return ESP_FAIL;
+    }
+    /* Larger than the 32-char limit so an over-long name reaches the validator
+     * instead of being silently truncated into something acceptable. */
+    char name[128] = {0};
+    url_decode(name, sizeof(name), raw);
+
+    if (!valid_ssid(name)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "1-32 characters, no leading/trailing space, no control characters");
+        return ESP_FAIL;
+    }
+    if (strcmp(name, ap_ssid_full) == 0) {
+        httpd_resp_sendstr(req, "OK");   /* unchanged */
+        return ESP_OK;
+    }
+
+    strncpy(ap_ssid_full, name, sizeof(ap_ssid_full) - 1);
+    ap_ssid_full[sizeof(ap_ssid_full) - 1] = '\0';
+    save_ap_ssid();
+
+    /* Answer before touching the radio. Changing the SSID restarts WiFi, which
+     * tears down this very HTTP connection, so responding first is what keeps a
+     * successful change from looking like a failure in the browser. Every client
+     * is dropped and the upstream link re-establishes itself. */
+    httpd_resp_sendstr(req, "OK");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    apply_ap_config();
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_wifi_start();
+    xEventGroupSetBits(s_wifi_eg, STA_BACKOFF_RESET_BIT | STA_NEED_CONNECT_BIT);
+
+    ESP_LOGI(TAG_MAIN, "AP name changed to '%s'", ap_ssid_full);
+    return ESP_OK;
+}
+
+static esp_err_t webauth_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "user", s_web_user);
+    /* Never send the password itself - only whether one is set. */
+    cJSON_AddBoolToObject(root, "enabled", s_web_pass[0] != '\0');
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_webauth_post_handler(httpd_req_t *req)
+{
+    char buf[256] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_user[64] = {0}, raw_pass[128] = {0};
+    httpd_query_key_value(buf, "user", raw_user, sizeof(raw_user));
+    if (httpd_query_key_value(buf, "pass", raw_pass, sizeof(raw_pass)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pass required (empty to disable)");
+        return ESP_FAIL;
+    }
+    char user[64] = {0}, pass[128] = {0};
+    url_decode(user, sizeof(user), raw_user);
+    url_decode(pass, sizeof(pass), raw_pass);
+
+    if (pass[0] == '\0') {
+        /* Disabling is deliberate, so do it rather than refuse. */
+        s_web_pass[0] = '\0';
+        save_panel_auth();
+        rebuild_expected_auth();
+        ESP_LOGW(TAG_MAIN, "panel password cleared: the web interface is now OPEN");
+        httpd_resp_sendstr(req, "OK");
+        return ESP_OK;
+    }
+
+    if (strlen(pass) < 8 || strlen(pass) > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password must be 8-64 characters");
+        return ESP_FAIL;
+    }
+    if (user[0] == '\0' || strlen(user) > 32 || strchr(user, ':') != NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "user must be 1-32 characters and contain no ':'");
+        return ESP_FAIL;
+    }
+
+    strncpy(s_web_user, user, sizeof(s_web_user) - 1);
+    s_web_user[sizeof(s_web_user) - 1] = '\0';
+    strncpy(s_web_pass, pass, sizeof(s_web_pass) - 1);
+    s_web_pass[sizeof(s_web_pass) - 1] = '\0';
+    save_panel_auth();
+    rebuild_expected_auth();
+    ESP_LOGI(TAG_MAIN, "panel credentials updated, user '%s'", s_web_user);
+
+    /* The browser now holds a stale credential, so tell it to re-prompt. */
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 static esp_err_t hostname_get_handler(httpd_req_t *req)
@@ -1900,7 +2320,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 36;
+    cfg.max_uri_handlers = 40;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -1910,36 +2330,48 @@ static void start_http_server(void)
         return;
     }
 
-    const httpd_uri_t uris[] = {
-        { .uri = "/",           .method = HTTP_GET,  .handler = root_get_handler },
-        { .uri = "/status",     .method = HTTP_GET,  .handler = status_get_handler },
-        { .uri = "/scan",       .method = HTTP_GET,  .handler = scan_get_handler },
-        { .uri = "/connect",    .method = HTTP_POST, .handler = connect_post_handler },
-        { .uri = "/api/appass", .method = HTTP_GET,  .handler = ap_pass_get_handler },
-        { .uri = "/setpass",    .method = HTTP_POST, .handler = set_pass_post_handler },
-        { .uri = "/resetpass",  .method = HTTP_POST, .handler = reset_pass_handler },
-        { .uri = "/api/dohurl", .method = HTTP_GET,  .handler = doh_url_get_handler },
-        { .uri = "/setdohurl",  .method = HTTP_POST, .handler = set_doh_url_post_handler },
-        { .uri = "/api/clients", .method = HTTP_GET, .handler = clients_get_handler },
-        { .uri = "/api/radio",   .method = HTTP_GET,  .handler = radio_get_handler },
-        { .uri = "/setradio",    .method = HTTP_POST, .handler = set_radio_post_handler },
-        { .uri = "/api/leases",  .method = HTTP_GET,  .handler = leases_get_handler },
-        { .uri = "/lease/add",   .method = HTTP_POST, .handler = add_lease_post_handler },
-        { .uri = "/lease/del",   .method = HTTP_POST, .handler = del_lease_post_handler },
-        { .uri = "/api/dnsrules", .method = HTTP_GET,  .handler = dnsrules_get_handler },
-        { .uri = "/api/hostname", .method = HTTP_GET,  .handler = hostname_get_handler },
-        { .uri = "/sethostname",  .method = HTTP_POST, .handler = set_hostname_post_handler },
-        { .uri = "/dnsrule/set",  .method = HTTP_POST, .handler = set_dnsrule_post_handler },
-        { .uri = "/dnsrule/del",  .method = HTTP_POST, .handler = del_dnsrule_post_handler },
-        { .uri = "/api/dnstest",  .method = HTTP_GET,  .handler = dnstest_get_handler },
-        { .uri = "/api/portmaps", .method = HTTP_GET,  .handler = portmaps_get_handler },
-        { .uri = "/portmap/add",  .method = HTTP_POST, .handler = add_portmap_post_handler },
-        { .uri = "/portmap/del",  .method = HTTP_POST, .handler = del_portmap_post_handler },
+    /* Static, because httpd_register_uri_handler stores the user_ctx pointer and
+     * it has to outlive this call. */
+    static route_t routes[] = {
+        { { .uri = "/",           .method = HTTP_GET  }, root_get_handler },
+        { { .uri = "/status",     .method = HTTP_GET  }, status_get_handler },
+        { { .uri = "/scan",       .method = HTTP_GET  }, scan_get_handler },
+        { { .uri = "/connect",    .method = HTTP_POST }, connect_post_handler },
+        { { .uri = "/api/appass", .method = HTTP_GET  }, ap_pass_get_handler },
+        { { .uri = "/setpass",    .method = HTTP_POST }, set_pass_post_handler },
+        { { .uri = "/resetpass",  .method = HTTP_POST }, reset_pass_handler },
+        { { .uri = "/api/dohurl", .method = HTTP_GET  }, doh_url_get_handler },
+        { { .uri = "/setdohurl",  .method = HTTP_POST }, set_doh_url_post_handler },
+        { { .uri = "/api/clients", .method = HTTP_GET }, clients_get_handler },
+        { { .uri = "/api/radio",   .method = HTTP_GET  }, radio_get_handler },
+        { { .uri = "/setradio",    .method = HTTP_POST }, set_radio_post_handler },
+        { { .uri = "/api/leases",  .method = HTTP_GET  }, leases_get_handler },
+        { { .uri = "/lease/add",   .method = HTTP_POST }, add_lease_post_handler },
+        { { .uri = "/lease/del",   .method = HTTP_POST }, del_lease_post_handler },
+        { { .uri = "/api/dnsrules", .method = HTTP_GET  }, dnsrules_get_handler },
+        { { .uri = "/api/hostname", .method = HTTP_GET  }, hostname_get_handler },
+        { { .uri = "/sethostname",  .method = HTTP_POST }, set_hostname_post_handler },
+        { { .uri = "/dnsrule/set",  .method = HTTP_POST }, set_dnsrule_post_handler },
+        { { .uri = "/dnsrule/del",  .method = HTTP_POST }, del_dnsrule_post_handler },
+        { { .uri = "/api/dnstest",  .method = HTTP_GET  }, dnstest_get_handler },
+        { { .uri = "/api/portmaps", .method = HTTP_GET  }, portmaps_get_handler },
+        { { .uri = "/portmap/add",  .method = HTTP_POST }, add_portmap_post_handler },
+        { { .uri = "/portmap/del",  .method = HTTP_POST }, del_portmap_post_handler },
+        { { .uri = "/api/ssid",     .method = HTTP_GET  }, ssid_get_handler },
+        { { .uri = "/setssid",      .method = HTTP_POST }, set_ssid_post_handler },
+        { { .uri = "/api/webauth",  .method = HTTP_GET  }, webauth_get_handler },
+        { { .uri = "/setwebauth",   .method = HTTP_POST }, set_webauth_post_handler },
     };
-    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-        httpd_register_uri_handler(server, &uris[i]);
+
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        routes[i].uri.handler = auth_trampoline;
+        routes[i].uri.user_ctx = &routes[i];
+        if (httpd_register_uri_handler(server, &routes[i].uri) != ESP_OK) {
+            ESP_LOGE(TAG_MAIN, "could not register %s", routes[i].uri.uri);
+        }
     }
-    ESP_LOGI(TAG_MAIN, "web interface ready on http://192.168.4.1");
+    ESP_LOGI(TAG_MAIN, "web interface ready on http://%s.local/ (AP: http://192.168.4.1/)",
+             s_mdns_host);
 }
 
 /* ======================= main ======================= */
@@ -1959,10 +2391,9 @@ void app_main(void)
     load_wifi_credentials();
     load_doh_url();
     load_mdns_host();
+    load_ap_ssid();
+    load_panel_auth();
     load_radio_settings();
-
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
 
     bool password_generated = false;
     nvs_handle_t h;
@@ -1976,9 +2407,6 @@ void app_main(void)
         }
         nvs_close(h);
     }
-    snprintf(ap_ssid_full, sizeof(ap_ssid_full), "%s-%02X%02X",
-             AP_SSID_PREFIX, mac[4], mac[5]);
-
     ESP_LOGI(TAG_MAIN, "==============================");
     ESP_LOGI(TAG_MAIN, "AP SSID:     %s", ap_ssid_full);
     ESP_LOGI(TAG_MAIN, "AP Password: %s", ap_password);

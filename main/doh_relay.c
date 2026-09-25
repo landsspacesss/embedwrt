@@ -1189,11 +1189,15 @@ const char *doh_relay_mode(void)
     if (!s_ctx.started) {
         return "off";
     }
+    /* Stable identifiers, not prose: the web UI has to translate this, and
+     * parsing an English sentence to decide which state it is was fragile - the
+     * JS classified anything unfamiliar as "falling back to plaintext", so a
+     * resolver that had simply not been used yet was reported as degraded. */
     if (!s_ctx.time_synced) {
-        return "fallback (waiting for clock)";
+        return "clock";
     }
     if (s_ctx.last_default_path == PATH_PLAIN || s_ctx.last_default_path == PATH_SERVFAIL) {
-        return "fallback (resolver failing)";
+        return "plain";
     }
     if (s_ctx.last_default_path == PATH_DOH) {
         return "doh";

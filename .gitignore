@@ -14,3 +14,7 @@ dependencies.lock
 .idea/
 *.swp
 *~
+
+# Playwright MCP artifacts (screenshots, console logs)
+.playwright-mcp/
+panel-*.png
