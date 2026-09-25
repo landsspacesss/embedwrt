@@ -42,7 +42,7 @@ the old values.
 
 ## The web page is generated — do not hand-edit it
 
-`html_page` in `main/my_wifi_router.c` is ~2500 lines of escaped C string
+`html_page` in `main/my_wifi_router.c` is ~2900 lines of escaped C string
 literals. It is produced from `tools/gen_page.py`, which holds the document
 naturally and emits the literals:
 
@@ -69,6 +69,18 @@ because each one caught a real breakage:
   is bilingual (English/Chinese). Keys reached indirectly, e.g. as values of a
   lookup table like `DOH_STATE`, are exempted — verify those by hand.
 
+**When editing the generator, splice by function boundary and watch the output
+size.** A rewrite of one function once deleted ~20 KB of unrelated JavaScript,
+because the end marker I chose occurred *earlier in the file* than the start
+marker, so `s[:i] + new + s[j:]` silently removed everything between them instead
+of replacing a function. The key check caught only a symptom (a missing
+translation key). Recovery that worked: **restore the file from git and re-apply
+the edits one at a time, checking a list of expected function names after each
+step** — not patching the damaged copy. Two habits: pick the splice end as *the
+next top-level `function` definition*, never a comment that could appear anywhere;
+and sanity-check the served size (~55 KB). A drop of tens of KB means something
+was deleted.
+
 ## Where the pieces live
 
 Most logic is in its own module; `my_wifi_router.c` is the largest file mainly
@@ -78,15 +90,17 @@ because it owns the HTML and the HTTP handlers.
 |---|---|
 | `my_wifi_router.c` | Boot sequence, WiFi state machine, AP/STA config, every HTTP handler, the generated page |
 | `dhcps/` | A vendored copy of ESP-IDF's DHCP server, extended for static leases |
+| `ap_dhcp.c` | Starts that server and owns the rollback switch back to IDF's |
 | `doh_relay.c` | UDP :53 listener, resolver selection, cache, per-resolver circuit breakers |
 | `dot_client.c` | DNS-over-TLS: TLS stream plus the 2-byte length prefix |
 | `dns_rules.c` | Per-device resolver policy (MAC → mode + address) |
 | `static_leases.c` | MAC → fixed address |
+| `devices.c` | IoT flag and owner per MAC, plus the two ownership policies |
 | `portmap.c` | Port forwarding |
 | `ap_acl.c` | AP client allow-list |
-| `clients.c` | Associated-station table with AP-side RSSI |
-| `web_auth.c` | Panel sessions and roles |
-| `led_off.c` | Blanks the onboard WS2812 at boot |
+| `clients.c` | Associated-station table with AP-side RSSI, and IP → MAC |
+| `web_auth.c` | Panel sessions, roles, and client-address resolution |
+| `led_off.c` | Blanks the onboard WS2812 at boot (`led_strip_encoder.c` is IDF's, unmodified) |
 
 ### Request and packet flow
 
@@ -104,18 +118,54 @@ Client DNS goes to `192.168.4.1` (advertised by the DHCP server, which must poin
 clients at *us* or they would bypass the relay). `doh_relay.c` answers and picks
 a resolver per client MAC via `dns_rules.c`.
 
+### Roles and device scoping
+
+Two roles. **Admin** comes from a session cookie (`web_auth.c`); **guest** is
+everything else. With no admin password set, every request is admin — the
+behaviour from before roles existed, so a device that was never given a password
+stays open rather than silently becoming guest-only.
+
+A guest's identity is its **request's source address, mapped back to a MAC**
+through `clients.c`, because an HTTP request carries nothing else. That single
+fact drives the whole design:
+
+- `caller_may_touch()` is the one authorization primitive in the request path:
+  admins touch anything, a guest only what `devices.c` says it may - its own
+  device, plus IoT devices it owns.
+- **Listing is deliberately wider than editing.** `/api/clients` and `/api/devices`
+  use `devices_listed_for_guest()`, which also includes *unowned* IoT devices so a
+  guest can see one to claim it; the write guards still use `devices_visible()`.
+  Rendering an edit form for a claimable-only device would just produce 403s.
+- A caller from the upstream LAN has no MAC in the client table, so it owns
+  nothing and sees nothing until it logs in. That is the correct outcome, not a
+  gap - it has no device on this AP.
+
+Two ownership policies live in `devices.c`, both on by default and both
+admin-only to change: **guest_claim** lets a visitor take an *unowned* IoT device
+(so one visitor cannot take a device another already manages) and hand it back;
+**clear_on_visit** drops a device's IoT flag when that device *itself* loads the
+panel, on the grounds that anything able to open a web UI is not a dumb IoT
+device. The second only ever affects the requesting device's own record, which is
+why it cannot lock anyone out.
+
 ### Storage
 
 One NVS namespace, `"storage"`. Strings: `ssid`, `password` (upstream),
 `ap_ssid`, `ap_pass`, `ap_hidden`, `ap_maxconn`, `ap_txpower`, `doh_url`,
 `mdns_host`, `web_user`, `web_pass`. Blobs: `leases`, `dnsrules`, `pforwards`,
-`acl`.
+`acl`, `devices`. Single bytes: `guestclaim`, `iotclrvis`.
 
-The hot-path tables (`static_leases`, `dns_rules`, `ap_acl`) are **double
-buffered**: readers follow an index and never take a lock, writers build into the
-inactive copy and publish with a single store. They are read from the DNS hot
-path and from the lwIP TCPIP thread, where blocking would stall forwarding for
+The hot-path tables (`static_leases`, `dns_rules`, `ap_acl`, `devices`) are
+**double buffered**: readers follow an index and never take a lock, writers build
+into the inactive copy and publish with a single store. They are read from the DNS
+hot path and from the lwIP TCPIP thread, where blocking would stall forwarding for
 every client.
+
+Two habits worth keeping when adding a stored setting: **give the policy flags
+their own keys rather than fields in a records blob**, because growing that struct
+fails its size check on load and silently wipes every record; and **skip the NVS
+write when nothing changes**, since `devices_clear_iot()` is called on *every*
+request and committing each time would wear the flash for no reason.
 
 ## Gotchas that cost real time
 
@@ -148,10 +198,26 @@ panel unreachable entirely (ping fine, HTTP dead). Two consequences:
   rather than silently resetting the loser) but with no eviction idle keep-alive
   connections exhaust the pool permanently.
 
+**`getpeername()` on an httpd request returns an IPv4-mapped IPv6 address.**
+Family `AF_INET6`, `::ffff:a.b.c.d`, because the server socket is dual-stack.
+Checking only for `AF_INET` rejects *every* request, which is subtle: guest
+identity silently fails for all callers, and it looks like a permissions problem
+rather than an address-parsing one. Accept both forms — `web_auth_client_ip()` is
+the place. And when a lookup like this fails, **log the actual values** (`fd`,
+family, length); guessing did not converge here, and one temporary log line named
+it immediately. A bug that fails identically for a known-good caller is not
+caller-specific: testing from the dev host, which is certainly not a client,
+ruled out anything to do with the phone.
+
 **Every route carries an explicit `admin_only` flag** and all of them go through
-one trampoline, so a new endpoint cannot be added without a decision about who
-may reach it. `httpd_resp_set_hdr`-style oversights are not possible here because
-the flag is positional in the route table.
+one trampoline, so a new endpoint cannot be added without a decision about who may
+reach it. Most routes are admin-only; the guest-reachable ones are exactly `/`,
+`/api/session`, `/login`, `/logout`, `/api/clients`, `/api/leases`,
+`/api/dnsrules`, `/api/devices`, `/claim`, and the four device-scoped writes
+(`/lease/add`, `/lease/del`, `/dnsrule/set`, `/dnsrule/del`). Those four are
+deliberately *not* admin-only at the route level: they would otherwise return 401
+before the per-device guard could decide, and a guest could never edit its own
+device. They rely on `caller_may_touch()` instead, which fails closed.
 
 **Reaching the panel over the network from the dev host:** the panel password
 lives in NVS, and there is no in-band recovery if it is forgotten. Clearing it
@@ -184,9 +250,18 @@ as `http://`.
 
 ## Current state
 
-`master` holds the working repeater plus every feature below. The panel currently
-has two roles: an administrator (session cookie) and an unauthenticated guest. The
-guest view exists and issues no admin requests, but **guest scoping is not
-implemented yet** — a guest sees a notice rather than its own device. Next: let a
-guest see and edit its own device and the devices it owns, via MAC-keyed IoT
-ownership with administrator re-assignment.
+`master` holds the working repeater plus every feature: static leases, port
+forwarding, per-device DNS (DoH/DoT/plain), the client list, AP controls, mDNS,
+sessions with an admin/guest role split, and MAC-keyed IoT ownership with the two
+claim policies above.
+
+**Verified on hardware:** NAT forwarding (11.87 Mbps at close range, measured
+server-side), DHCP including the awkward static-lease path, per-device DNS routing,
+the client list with AP-side RSSI, mDNS resolution, the login/logout cycle, and the
+socket-pool and address-resolution fixes.
+
+**Not verified:** the guest path end to end — claiming a device, releasing it, and
+editing its own lease and DNS from a device on the AP. Every piece is in place and
+the HTTP-level refusals are tested, but the positive path needs a browser on the
+AP, which had not happened when this was written. Treat "guest mode works" as
+unproven until that is exercised.
