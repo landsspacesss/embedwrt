@@ -22,6 +22,7 @@
 #include "esp_timer.h"
 #include "mdns.h"
 #include "esp_tls_crypto.h"   /* esp_crypto_base64_encode, for HTTP Basic auth */
+#include "ap_acl.h"
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
@@ -95,7 +96,6 @@ static char doh_url[DOH_URL_MAX] = DOH_DEFAULT_URL;
 static bool s_bw_ht20 = false;   /* false = HT40, which is the driver default */
 static wifi_country_t s_country_at_boot;
 static bool s_country_at_boot_valid = false;
-static int8_t s_txpower_qdbm = 0;   /* quarter-dBm; 80 == 20 dBm */
 
 /* ======================= NVS ======================= */
 
@@ -375,6 +375,57 @@ static bool valid_ssid(const char *s)
     return true;
 }
 
+/* ======================= AP settings ======================= */
+
+/*
+ * Hide-SSID, max clients and TX power. These live as plain variables loaded from
+ * NVS rather than in a struct, matching how the AP name is handled.
+ */
+static bool s_ap_hidden;
+static uint8_t s_ap_maxconn = 7;
+static int8_t s_txpower_qdbm = 80;    /* 0.25 dBm units, so 80 = 20 dBm */
+
+#define AP_MAXCONN_MIN 1
+#define AP_MAXCONN_MAX 10          /* the driver's ceiling for a soft-AP */
+#define AP_TXPOWER_MIN 8           /* 2 dBm  */
+#define AP_TXPOWER_MAX 84          /* 21 dBm */
+
+static void load_ap_settings(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    uint8_t u = 0;
+    if (nvs_get_u8(h, "ap_hidden", &u) == ESP_OK) {
+        s_ap_hidden = (u != 0);
+    }
+    if (nvs_get_u8(h, "ap_maxconn", &u) == ESP_OK &&
+            u >= AP_MAXCONN_MIN && u <= AP_MAXCONN_MAX) {
+        s_ap_maxconn = u;
+    }
+    int8_t p = 0;
+    if (nvs_get_i8(h, "ap_txpower", &p) == ESP_OK &&
+            p >= AP_TXPOWER_MIN && p <= AP_TXPOWER_MAX) {
+        s_txpower_qdbm = p;
+    }
+    nvs_close(h);
+}
+
+static esp_err_t save_ap_settings(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    nvs_set_u8(h, "ap_hidden", s_ap_hidden ? 1 : 0);
+    nvs_set_u8(h, "ap_maxconn", s_ap_maxconn);
+    nvs_set_i8(h, "ap_txpower", s_txpower_qdbm);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
 /* ======================= radio tuning ======================= */
 
 /*
@@ -457,7 +508,8 @@ static esp_err_t apply_ap_config(void)
     memcpy(c.ap.ssid, ap_ssid_full, len);
     c.ap.ssid_len = (uint8_t)len;
     c.ap.channel = 0; /* let the driver keep the AP on the station's channel */
-    c.ap.max_connection = AP_MAX_CONN;
+    c.ap.max_connection = s_ap_maxconn;
+    c.ap.ssid_hidden = s_ap_hidden ? 1 : 0;
     c.ap.pmf_cfg.capable = true;
     c.ap.pmf_cfg.required = false;
 
@@ -505,6 +557,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_ap_staconnected_t *e = event_data;
         ESP_LOGI(TAG_AP, "client " MACSTR " joined, aid=%d", MAC2STR(e->mac), e->aid);
         clients_note_join(e->mac);
+        /* Enforced after the fact: IDF cannot refuse an association, so a
+         * disallowed station is deauthenticated the moment it appears. */
+        ap_acl_kick_if_denied(e->mac);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = event_data;
         ESP_LOGI(TAG_AP, "client " MACSTR " left, aid=%d, reason=%d",
@@ -853,6 +908,27 @@ static const char *html_page =
 "    <div id='pm-list' style='margin-top:12px'></div>"
 "    <div id='pm-msg' class='hint' style='margin-top:10px'></div>"
 ""
+"    <h2 data-i18n='sec_apctl'>AP controls</h2>"
+"    <div class='form-group'><label data-i18n='hidden_label'>Hide SSID</label>"
+"      <select id='ap-hidden'><option value='0'>OFF</option><option value='1'>ON</option></select>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='hidden_hint'></div></div>"
+"    <div class='row form-group'>"
+"      <div><label data-i18n='maxconn_label'>Max clients</label><input type='text' id='ap-maxconn'></div>"
+"      <div><label data-i18n='txpower_label'>TX power</label><input type='text' id='ap-txpower'></div>"
+"    </div>"
+"    <div class='hint' data-i18n='txpower_hint'></div>"
+"    <div class='hint' data-i18n='restart_note'></div>"
+"    <button class='btn' onclick='saveApCfg()' data-i18n='save_apctl_btn'>APPLY AP SETTINGS</button>"
+""
+"    <h2 data-i18n='sec_acl'>Client allow-list</h2>"
+"    <div class='hint' data-i18n='acl_hint'></div>"
+"    <div id='acl-state' class='hint'></div>"
+"    <div class='row form-group'><div><label data-i18n='mac_label'>MAC</label><input type='text' id='acl-mac' placeholder='aa:bb:cc:dd:ee:ff'></div></div>"
+"    <button class='btn small' onclick='aclAdd()' data-i18n='acl_add_btn'>ADD MAC</button>"
+"    <div style='margin-top:8px'><button class='btn small' onclick='aclToggle()' id='acl-toggle-btn'>ENFORCE</button></div>"
+"    <div id='acl-list' style='margin-top:12px'></div>"
+"    <div id='acl-msg' class='hint' style='margin-top:10px'></div>"
+""
 "    <h2 data-i18n='sec_about'>About</h2>"
 "    <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>"
 "    <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>"
@@ -889,6 +965,13 @@ static const char *html_page =
 " mac_label:'MAC',ip_label:'IP',add_lease_btn:'ADD LEASE',"
 " sec_fwd:'Port forwarding',fwd_hint:'Reachable from the upstream network only. The external address is what this device holds on the upstream side, and that address is itself behind the router NAT.',"
 " proto_label:'Protocol',ext_port:'Ext port',target_ip:'Target IP',target_port:'Target port',add_fwd_btn:'ADD FORWARD',"
+" sec_apctl:'AP controls',hidden_label:'Hide SSID',hidden_hint:'The network stops broadcasting its name. Clients must be told the name to join, and hidden networks are not actually more private - the name is still visible in the traffic.',"
+" maxconn_label:'Max clients',txpower_label:'TX power (dBm)',txpower_hint:'Lowering this can reduce interference; range may suffer.',"
+" save_apctl_btn:'APPLY AP SETTINGS',restart_note:'Changing hide-SSID or the client limit restarts the radio, so all clients drop for a few seconds.',"
+" sec_acl:'Client allow-list',acl_hint:'NOT access control. ESP-IDF cannot refuse an association, so a disallowed client completes the handshake first and is then deauthenticated. It appears in the client list each time it retries. Treat this as a deterrent.',"
+" acl_state_on:'Allow-list is ENFORCED.',acl_state_off:'Allow-list is off; every client may join.',"
+" acl_add_btn:'ADD MAC',acl_enable_btn:'ENFORCE LIST',acl_disable_btn:'STOP ENFORCING',"
+" acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',"
 " sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
 " loading:'Loading...',no_clients:'No clients',no_rules:'No rules',no_leases:'No static leases',no_forwards:'No rules',no_networks:'No networks',scan_failed:'Scan failed',failed_load:'Failed to load',"
 " active:'(active)',delete:'delete',uptime:'up',unknown:'unknown',"
@@ -929,6 +1012,13 @@ static const char *html_page =
 " mac_label:'MAC',ip_label:'IP',add_lease_btn:'添加租约',"
 " sec_fwd:'端口转发',fwd_hint:'只能从上级网络访问：外部地址是本机在上级网络的地址，而它本身还在路由器的 NAT 后面。',"
 " proto_label:'协议',ext_port:'外部端口',target_ip:'目标 IP',target_port:'目标端口',add_fwd_btn:'添加转发',"
+" sec_apctl:'热点控制',hidden_label:'隐藏 SSID',hidden_hint:'不再广播网络名。客户端必须知道名字才能加入；而且隐藏网络并不真的更私密——名字仍会出现在无线流量里。',"
+" maxconn_label:'最大客户端数',txpower_label:'发射功率（dBm）',txpower_hint:'降低可减少干扰，但覆盖距离可能变差。',"
+" save_apctl_btn:'应用热点设置',restart_note:'修改隐藏 SSID 或客户端上限会重启射频，所有客户端会断开几秒。',"
+" sec_acl:'客户端白名单',acl_hint:'这不是真正的接入控制。ESP-IDF 无法在关联时拒绝，所以不在名单上的客户端会先完成握手，然后被踢下线。它每次重试都会出现在客户端列表里。只能当作威慢手段。',"
+" acl_state_on:'白名单已生效。',acl_state_off:'白名单已关闭，任何客户端都能加入。',"
+" acl_add_btn:'添加 MAC',acl_enable_btn:'启用名单',acl_disable_btn:'停止过滤',"
+" acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',"
 " sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
 " loading:'加载中...',no_clients:'暂无客户端',no_rules:'暂无规则',no_leases:'暂无静态租约',no_forwards:'暂无规则',no_networks:'未发现网络',scan_failed:'扫描失败',failed_load:'加载失败',"
 " active:'（当前）',delete:'删除',uptime:'在线',unknown:'未知',"
@@ -977,7 +1067,7 @@ static const char *html_page =
 "  document.getElementById('tab-'+tab).classList.add('active');"
 "  refreshActiveTab();"
 "}"
-"function loadSettings(){loadSsid();loadAuth();loadDoh();loadRadio();loadLeases();loadDnsRules();loadPortmaps();loadHostname()}"
+"function loadSettings(){loadSsid();loadAuth();loadDoh();loadRadio();loadApCfg();loadAcl();loadLeases();loadDnsRules();loadPortmaps();loadHostname()}"
 "function init(){"
 "  fetch('/status').then(function(r){return r.json()}).then(function(d){"
 "    var msg=document.getElementById('status-msg');"
@@ -1188,6 +1278,65 @@ static const char *html_page =
 "function delPortmap(proto,mport){"
 "  if(!confirm(t('confirm_fwd')+' '+proto+' '+mport+' ?')){return}"
 "  fetch('/portmap/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'proto='+proto+'&mport='+mport}).then(function(){loadPortmaps()});"
+"}"
+"function loadApCfg(){"
+"  fetch('/api/apcfg').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('ap-hidden').value=d.hidden?'1':'0';"
+"    document.getElementById('ap-maxconn').value=d.maxconn;"
+"    document.getElementById('ap-txpower').value=d.txpower_dbm;"
+"  }).catch(function(){});"
+"}"
+"function saveApCfg(){"
+"  var h=document.getElementById('ap-hidden').value;"
+"  var c=document.getElementById('ap-maxconn').value.trim();"
+"  var p=document.getElementById('ap-txpower').value.trim();"
+"  var m=document.getElementById('settings-msg');"
+"  if(!c||!p){m.innerHTML='<span style=\"color:#b45309\">'+t('enter_both')+'</span>';return}"
+"  var btn=event.target;btn.innerText='...';"
+"  fetch('/setapcfg',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hidden='+h+'&maxconn='+encodeURIComponent(c)+'&txpower='+encodeURIComponent(p)})"
+"  .then(function(r){return r.text().then(function(x){m.innerHTML=r.ok?t('applied'):(t('rejected')+': '+x)})})"
+"  .finally(function(){btn.innerText=t('save_apctl_btn');loadApCfg()});"
+"}"
+"function loadAcl(){"
+"  var box=document.getElementById('acl-list');"
+"  fetch('/api/acl').then(function(r){return r.json()}).then(function(d){"
+"    var st=document.getElementById('acl-state');"
+"    st.innerHTML=d.enabled?('<b>'+t('acl_state_on')+'</b>'):t('acl_state_off');"
+"    st.style.color=d.enabled?'#b45309':'#64748b';"
+"    document.getElementById('acl-toggle-btn').innerHTML=d.enabled?t('acl_disable_btn'):t('acl_enable_btn');"
+"    document.getElementById('acl-toggle-btn').className='btn small'+(d.enabled?' danger':'');"
+"    if(!d.macs.length){box.innerHTML='<div class=\"loading\">'+t('acl_empty')+'</div>';return}"
+"    var h='<div class=\"network-list\" style=\"max-height:none\">';"
+"    d.macs.forEach(function(m){"
+"      h+=\"<div class='network-item' style='cursor:default'><div style='display:flex;justify-content:space-between;align-items:center;width:100%'>\""
+"        +\"<span class='mono' style='font-size:12px'>\"+m+\"</span>\""
+"        +\"<button class='refresh-btn' onclick='aclDel(\\\"\"+m+\"\\\")'>\"+t('delete')+\"</button></div></div>\";"
+"    });"
+"    box.innerHTML=h+'</div>';"
+"  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
+"}"
+"function aclAdd(){"
+"  var mac=document.getElementById('acl-mac').value.trim(),m=document.getElementById('acl-msg');"
+"  if(!mac){m.innerHTML='<span style=\"color:#b45309\">'+t('enter_both')+'</span>';return}"
+"  fetch('/acl/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)})"
+"  .then(function(r){return r.text().then(function(x){"
+"    m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>'):('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"    if(r.ok){document.getElementById('acl-mac').value=''}"
+"    loadAcl();"
+"  })});"
+"}"
+"function aclDel(mac){"
+"  fetch('/acl/del',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)}).then(function(){loadAcl()});"
+"}"
+"function aclToggle(){"
+"  fetch('/api/acl').then(function(r){return r.json()}).then(function(d){"
+"    var on=d.enabled?'0':'1',m=document.getElementById('acl-msg');"
+"    fetch('/acl/enable',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'on='+on})"
+"    .then(function(r){return r.text().then(function(x){"
+"      m.innerHTML=r.ok?('<span style=\"color:#15803d\">'+t('saved')+'</span>'):('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>');"
+"      loadAcl();"
+"    })});"
+"  });"
 "}"
 "function loadHostname(){fetch('/api/hostname').then(function(r){return r.json()}).then(function(d){document.getElementById('mdns-name').value=d.hostname}).catch(function(){})}"
 "function saveHostname(){"
@@ -1562,6 +1711,217 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
 static const char *mode_name(uint8_t mode)
 {
     return (mode == DNS_MODE_DOT) ? "dot" : (mode == DNS_MODE_PLAIN ? "dns" : "doh");
+}
+
+static esp_err_t apcfg_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "hidden", s_ap_hidden);
+    cJSON_AddNumberToObject(root, "maxconn", s_ap_maxconn);
+    cJSON_AddNumberToObject(root, "txpower_dbm", s_txpower_qdbm * 0.25);
+    cJSON_AddNumberToObject(root, "txpower_min", AP_TXPOWER_MIN * 0.25);
+    cJSON_AddNumberToObject(root, "txpower_max", AP_TXPOWER_MAX * 0.25);
+    cJSON_AddNumberToObject(root, "maxconn_max", AP_MAXCONN_MAX);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_apcfg_post_handler(httpd_req_t *req)
+{
+    char buf[192] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_hidden[8] = {0}, raw_conn[8] = {0}, raw_power[16] = {0};
+    if (httpd_query_key_value(buf, "hidden", raw_hidden, sizeof(raw_hidden)) != ESP_OK ||
+            httpd_query_key_value(buf, "maxconn", raw_conn, sizeof(raw_conn)) != ESP_OK ||
+            httpd_query_key_value(buf, "txpower", raw_power, sizeof(raw_power)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hidden, maxconn and txpower required");
+        return ESP_FAIL;
+    }
+
+    long conn = strtol(raw_conn, NULL, 10);
+    if (conn < AP_MAXCONN_MIN || conn > AP_MAXCONN_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "max clients out of range");
+        return ESP_FAIL;
+    }
+    /* Percent-decoded so a decimal like 17.25 survives; strtod then rounds to
+     * the quarter-dBm step the driver uses. */
+    char power_s[16] = {0};
+    url_decode(power_s, sizeof(power_s), raw_power);
+    double dbm = atof(power_s);
+    int q = (int)(dbm * 4.0 + 0.5);
+    if (q < AP_TXPOWER_MIN || q > AP_TXPOWER_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "TX power out of range");
+        return ESP_FAIL;
+    }
+
+    bool hidden = (raw_hidden[0] == '1' || strcasecmp(raw_hidden, "true") == 0);
+    bool need_restart = (hidden != s_ap_hidden) || (conn != s_ap_maxconn);
+
+    s_ap_hidden = hidden;
+    s_ap_maxconn = (uint8_t)conn;
+    s_txpower_qdbm = (int8_t)q;
+    save_ap_settings();
+
+    /* TX power takes effect immediately and does not disturb the link. */
+    int8_t eff = 0;
+    if (esp_wifi_set_max_tx_power(s_txpower_qdbm) == ESP_OK &&
+            esp_wifi_get_max_tx_power(&eff) == ESP_OK) {
+        ESP_LOGI(TAG_MAIN, "TX power now %.2f dBm", eff * 0.25f);
+    }
+
+    if (need_restart) {
+        /* Hide-SSID and the client limit live in the AP config, which only
+         * applies on (re)start - and that drops every client, so answer first. */
+        httpd_resp_sendstr(req, "OK");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        apply_ap_config();
+        esp_wifi_stop();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_wifi_start();
+        xEventGroupSetBits(s_wifi_eg, STA_BACKOFF_RESET_BIT | STA_NEED_CONNECT_BIT);
+        ESP_LOGI(TAG_MAIN, "AP settings applied (hidden=%d maxconn=%u)",
+                 s_ap_hidden, s_ap_maxconn);
+        return ESP_OK;
+    }
+
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t acl_get_handler(httpd_req_t *req)
+{
+    uint8_t macs[AP_ACL_MAX][6];
+    int n = ap_acl_list(macs, AP_ACL_MAX);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", ap_acl_enabled());
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        char b[18];
+        snprintf(b, sizeof(b), MACSTR, MAC2STR(macs[i]));
+        cJSON_AddItemToArray(arr, cJSON_CreateString(b));
+    }
+    cJSON_AddItemToObject(root, "macs", arr);
+    cJSON_AddNumberToObject(root, "max", AP_ACL_MAX);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t acl_add_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    char raw[64] = {0}, mac_s[32] = {0};
+    if (httpd_query_key_value(buf, "mac", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    url_decode(mac_s, sizeof(mac_s), raw);
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    esp_err_t err = ap_acl_add(mac);
+    if (err == ESP_ERR_NO_MEM) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "list full");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    /* A newly allowed MAC that is somehow already being denied needs no action,
+     * but a newly added entry while the list is enabled should be honoured, so
+     * nothing to sweep for an add. */
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t acl_del_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    char raw[64] = {0}, mac_s[32] = {0};
+    if (httpd_query_key_value(buf, "mac", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    url_decode(mac_s, sizeof(mac_s), raw);
+    uint8_t mac[6];
+    if (!parse_mac(mac_s, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+    if (ap_acl_remove(mac) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not on the list");
+        return ESP_FAIL;
+    }
+    /* Removing an entry while the list is enforced should take effect at once,
+     * or the client would stay connected until it roams. */
+    ap_acl_enforce_all();
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+static esp_err_t acl_enable_post_handler(httpd_req_t *req)
+{
+    char buf[64] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    char raw[16] = {0};
+    if (httpd_query_key_value(buf, "on", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "on required");
+        return ESP_FAIL;
+    }
+    bool on = (raw[0] == '1' || strcasecmp(raw, "true") == 0);
+    esp_err_t err = ap_acl_set_enabled(on);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "add at least one MAC first: an empty list would kick every client");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    /* Answer first: the sweep below deauthenticates clients, and the caller may
+     * well be one of them. */
+    httpd_resp_sendstr(req, "OK");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ap_acl_enforce_all();
+    return ESP_OK;
 }
 
 static esp_err_t ssid_get_handler(httpd_req_t *req)
@@ -2320,7 +2680,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers = 48;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -2358,6 +2718,12 @@ static void start_http_server(void)
         { { .uri = "/portmap/add",  .method = HTTP_POST }, add_portmap_post_handler },
         { { .uri = "/portmap/del",  .method = HTTP_POST }, del_portmap_post_handler },
         { { .uri = "/api/ssid",     .method = HTTP_GET  }, ssid_get_handler },
+        { { .uri = "/api/apcfg",   .method = HTTP_GET  }, apcfg_get_handler },
+        { { .uri = "/setapcfg",    .method = HTTP_POST }, set_apcfg_post_handler },
+        { { .uri = "/api/acl",     .method = HTTP_GET  }, acl_get_handler },
+        { { .uri = "/acl/add",     .method = HTTP_POST }, acl_add_post_handler },
+        { { .uri = "/acl/del",     .method = HTTP_POST }, acl_del_post_handler },
+        { { .uri = "/acl/enable",  .method = HTTP_POST }, acl_enable_post_handler },
         { { .uri = "/setssid",      .method = HTTP_POST }, set_ssid_post_handler },
         { { .uri = "/api/webauth",  .method = HTTP_GET  }, webauth_get_handler },
         { { .uri = "/setwebauth",   .method = HTTP_POST }, set_webauth_post_handler },
@@ -2393,6 +2759,8 @@ void app_main(void)
     load_mdns_host();
     load_ap_ssid();
     load_panel_auth();
+    load_ap_settings();
+    ap_acl_init();
     load_radio_settings();
 
     bool password_generated = false;
@@ -2475,9 +2843,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG_MAIN, "wifi started, AP '%s'", ap_ssid_full);
 
-    /* 80 * 0.25 dBm = 20 dBm, the 2.4 GHz ceiling for CN. The world-safe default
-     * can be lower. Only settable once the driver has started. */
-    esp_err_t perr = esp_wifi_set_max_tx_power(80);
+    /* Default 80 * 0.25 dBm = 20 dBm, the 2.4 GHz ceiling for CN; the world-safe
+     * default can be lower. Only settable once the driver has started. */
+    esp_err_t perr = esp_wifi_set_max_tx_power(s_txpower_qdbm);
     int8_t eff_power = 0;
     if (esp_wifi_get_max_tx_power(&eff_power) == ESP_OK) {
         s_txpower_qdbm = eff_power;
@@ -2494,6 +2862,11 @@ void app_main(void)
      * every client behind the repeater. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG_MAIN, "wifi power save disabled");
+    ESP_LOGI(TAG_MAIN, "AP: hidden=%d maxconn=%u txpower=%.2f dBm",
+             s_ap_hidden, s_ap_maxconn, s_txpower_qdbm * 0.25f);
+    /* Kick anyone already associated who is not allowed, in case the list was
+     * enabled while the AP was down. */
+    ap_acl_enforce_all();
 
     ESP_ERROR_CHECK(ap_dhcp_start(ap_netif));
     ESP_ERROR_CHECK(doh_relay_start(ap_netif, sta_netif, doh_url));
