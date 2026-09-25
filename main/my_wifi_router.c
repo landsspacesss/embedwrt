@@ -2436,6 +2436,13 @@ static esp_err_t set_device_post_handler(httpd_req_t *req)
     }
     httpd_query_key_value(buf, "iot", raw_iot, sizeof(raw_iot));
 
+    /* Read the owner field BEFORE decoding it. A missing field means "leave
+     * ownership alone"; an explicitly empty one means "clear it". Splitting the
+     * read and the decode is how this went wrong once: the decode ran against a
+     * still-empty buffer, so every request looked like "clear". */
+    bool owner_given = (httpd_query_key_value(buf, "owner", raw_owner,
+                                              sizeof(raw_owner)) == ESP_OK);
+
     char mac_s[32] = {0}, owner_s[32] = {0};
     url_decode(mac_s, sizeof(mac_s), raw_mac);
     url_decode(owner_s, sizeof(owner_s), raw_owner);
@@ -2447,12 +2454,6 @@ static esp_err_t set_device_post_handler(httpd_req_t *req)
     }
     bool iot = (raw_iot[0] == '1' || strcasecmp(raw_iot, "true") == 0);
 
-    /* A missing `owner` field means "leave ownership alone"; an explicitly empty
-     * one means "clear it". Without that distinction a caller that only meant to
-     * toggle the IoT flag would silently wipe a user-visible assignment - which
-     * is exactly what an early version of this handler did. */
-    bool owner_given = (httpd_query_key_value(buf, "owner", raw_owner,
-                                              sizeof(raw_owner)) == ESP_OK);
     uint8_t owner[6];
     const uint8_t *owner_p = NULL;
     if (owner_given && owner_s[0] != '\0') {
