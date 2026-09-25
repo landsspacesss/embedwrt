@@ -188,37 +188,6 @@ typedef struct {
     bool admin_only;                       /* guests get 401 instead of the handler */
 } route_t;
 
-/* ======================= route authorization ======================= */
-
-/*
- * The per-request gate. Role resolution and the session table live in
- * web_auth.c; this only decides whether the route may run.
- *
- * Every route goes through here (registration sets it as the handler and passes
- * itself as user_ctx), so a new endpoint cannot be added without a decision
- * about who may reach it - the admin_only flag is not optional at the call site
- * because the struct initialiser would leave it false, which is the safe
- * default only if reviewed. Admin-only routes are listed explicitly below.
- */
-static esp_err_t auth_trampoline(httpd_req_t *req)
-{
-    const route_t *r = (const route_t *)req->user_ctx;
-    if (r == NULL || r->real == NULL) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    if (r->admin_only && web_auth_role_of(req) != WEB_ROLE_ADMIN) {
-        /* 401 rather than 403: the caller can fix this by logging in, and the
-         * UI keys its login prompt off exactly this status. */
-        httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"error\":\"login required\"}", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-    return r->real(req);
-}
-
 /*
  * Which device is this request coming from, and what may it touch?
  *
@@ -243,6 +212,54 @@ static bool caller_may_touch(httpd_req_t *req, const uint8_t target[6])
     }
     uint8_t me[6] = {0};
     return caller_mac(req, me) && devices_visible(target, me);
+}
+
+/* ======================= route authorization ======================= */
+
+/*
+ * The per-request gate. Role resolution and the session table live in
+ * web_auth.c; this only decides whether the route may run.
+ *
+ * Every route goes through here (registration sets it as the handler and passes
+ * itself as user_ctx), so a new endpoint cannot be added without a decision
+ * about who may reach it - the admin_only flag is not optional at the call site
+ * because the struct initialiser would leave it false, which is the safe
+ * default only if reviewed. Admin-only routes are listed explicitly below.
+ */
+static esp_err_t auth_trampoline(httpd_req_t *req)
+{
+    const route_t *r = (const route_t *)req->user_ctx;
+    if (r == NULL || r->real == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    /*
+     * A device that loads the panel is not a dumb IoT device any more, so drop
+     * its own IoT flag (configurable). This runs for every request, and only
+     * ever affects the requesting device's own record - which is why it cannot
+     * lock anyone out: a device always sees itself regardless of the flag, and
+     * the devices it owns keep theirs.
+     *
+     * Clearing is a no-op unless the flag was set, so there is no NVS write on
+     * the normal path.
+     */
+    if (devices_clear_iot_on_visit()) {
+        uint8_t self[6];
+        if (caller_mac(req, self)) {
+            devices_clear_iot(self);
+        }
+    }
+
+    if (r->admin_only && web_auth_role_of(req) != WEB_ROLE_ADMIN) {
+        /* 401 rather than 403: the caller can fix this by logging in, and the
+         * UI keys its login prompt off exactly this status. */
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"login required\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    return r->real(req);
 }
 
 /* ======================= AP name ======================= */
@@ -886,6 +903,13 @@ static const char *html_page =
 "    <div id='acl-list' style='margin-top:12px'></div>"
 "    <div id='acl-msg' class='hint' style='margin-top:10px'></div>"
 ""
+"    <h2 data-i18n='sec_policy'>Device ownership</h2>"
+"    <div class='form-group'><label><input type='checkbox' id='pol-claim' style='width:auto;margin-right:6px'><span data-i18n='guest_claim_label'></span></label>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='guest_claim_hint'></div></div>"
+"    <div class='form-group'><label><input type='checkbox' id='pol-clrvis' style='width:auto;margin-right:6px'><span data-i18n='clear_visit_label'></span></label>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='clear_visit_hint'></div></div>"
+"    <button class='btn' onclick='saveDevPolicy()' data-i18n='save_btn'>SAVE</button>"
+""
 "    <h2 data-i18n='sec_about'>About</h2>"
 "    <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>"
 "    <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>"
@@ -941,7 +965,7 @@ static const char *html_page =
 " acl_add_btn:'ADD MAC',acl_enable_btn:'ENFORCE LIST',acl_disable_btn:'STOP ENFORCING',"
 " acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',"
 " sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
-" loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',guest_devices:'Devices you can manage',device_offline:'offline',"
+" loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',claim_btn:'Claim',release_btn:'Release',sec_policy:'Device ownership',guest_claim_label:'Allow visitors to claim unowned IoT devices',guest_claim_hint:'A visitor can take an unowned IoT device without logging in, and release it again. Only unowned ones, so one visitor cannot take a device another already manages.',clear_visit_label:'Drop the IoT flag when that device opens the panel',clear_visit_hint:'Anything able to open a web UI is not a dumb IoT device. Only affects the device that visits.',claimable_hint:'Unowned - a visitor may claim this.',your_device:'Your device',guest_devices:'Devices you can manage',device_offline:'offline',"
 " login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',"
 " login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',"
 " login_failed:'Wrong user or password',login_ok:'Signed in',"
@@ -996,7 +1020,7 @@ static const char *html_page =
 " acl_add_btn:'添加 MAC',acl_enable_btn:'启用名单',acl_disable_btn:'停止过滤',"
 " acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',"
 " sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',"
-" loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',guest_devices:'你可以管理的设备',device_offline:'离线',"
+" loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',claim_btn:'认领',release_btn:'放弃',sec_policy:'设备归属',guest_claim_label:'允许访客认领无主的物联网设备',guest_claim_hint:'访客无需登录即可认领无主的物联网设备，也可以放弃。只限无主的，所以不会抢走别人已在管理的设备。',clear_visit_label:'该设备打开面板时自动取消其物联网标记',clear_visit_hint:'能自己打开网页的就不算哑设备。只影响访问面板的那台设备本身。',claimable_hint:'无主 - 访客可以认领。',your_device:'你的设备',guest_devices:'你可以管理的设备',device_offline:'离线',"
 " login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',"
 " login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',"
 " login_failed:'用户名或密码错误',login_ok:'已登录',"
@@ -1091,7 +1115,7 @@ static const char *html_page =
 "  return p;"
 "}"
 "function loadSettings(gen){"
-"  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,"
+"  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,loadDevPolicy,"
 "                        loadLeases,loadDnsRules,loadPortmaps,loadHostname],gen);"
 "}"
 "function init(){"
@@ -1271,17 +1295,20 @@ static const char *html_page =
 "                         :('<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>')}"
 "  })});"
 "}"
-"/* The guest's own devices: its own entry plus the IoT devices it owns. Driven by"
-"   /api/devices (which includes offline ones) unioned with /api/clients (which has"
-"   the live info), since a device can be owned while not currently associated. */"
+"/* The guest's devices: its own entry, the IoT devices it owns, and - when"
+"   claiming is enabled - unowned IoT devices it could take. Driven by /api/devices"
+"   (which knows the claim flags and includes offline devices) unioned with"
+"   /api/clients (which has the live hostname and address). */"
 "function loadGuestView(){"
 "  var box=document.getElementById('guest-devices');"
 "  box.innerHTML='<div class=\"loading\">'+t('loading')+'</div>';"
 "  fetchSeq(['/api/devices','/api/clients','/api/leases','/api/dnsrules']).then(function(res){"
 "    var D=res[0]||{},C=res[1]||[],L=res[2]||{},R=res[3]||{};"
+"    var me=D.me||'';"
+"    var rec={};(D.devices||[]).forEach(function(d){rec[d.mac]=d});"
 "    var live={};C.forEach(function(c){live[c.mac]=c});"
 "    var seen={},order=[];"
-"    function add(mac){if(mac&&!seen[mac]){seen[mac]=1;order.push(mac)}}"
+"    function add(m){if(m&&!seen[m]){seen[m]=1;order.push(m)}}"
 "    (D.devices||[]).forEach(function(d){add(d.mac)});"
 "    C.forEach(function(c){add(c.mac)});"
 "    if(!order.length){"
@@ -1291,7 +1318,11 @@ static const char *html_page =
 "    var h=\"<h2>\"+t('guest_devices')+\"</h2>\";"
 "    order.forEach(function(mac){"
 "      var id=mac.replace(/:/g,'');"
+"      var d=rec[mac]||{};"
 "      var c=live[mac];"
+"      var isSelf=(mac===me);"
+"      var editable=!!d.mine;              /* the server applies the same rule */"
+"      var claimable=!!d.claimable;"
 "      var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});"
 "      var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});"
 "      var head=(c&&c.host)?c.host:t('unknown');"
@@ -1301,17 +1332,32 @@ static const char *html_page =
 "        +\"<span class='mono' style='font-size:12px'>\"+mac+\"</span>\""
 "        +\"<span style='font-size:12px;color:\"+(c?'#15803d':'#94a3b8')+\"'>\""
 "        +(c?(c.ip||'?'):t('device_offline'))+\"</span></div>\";"
-"      h+=\"<div style='font-size:12px;color:#475569;margin-top:3px'>\"+head+\"</div>\";"
+"      h+=\"<div style='font-size:12px;color:#475569;margin-top:3px'>\"+head"
+"        +(isSelf?(' &middot; <b>'+t('your_device')+'</b>'):'')+\"</div>\";"
 "      h+=\"</div>\";"
-"      h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');"
+"      if(editable){"
+"        h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');"
+"        /* An owned IoT device: its holder may hand it back. */"
+"        if(d.iot&&d.owner===me&&!isSelf){"
+"          h+=\"<div style='padding:0 14px 12px;background:#f8fafc'>\""
+"            +\"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\\\"\"+mac+\"\\\")'>\""
+"            +t('release_btn')+\"</button></div>\";"
+"        }"
+"      }else if(claimable){"
+"        /* Not ours to edit, but shown so it can be claimed. */"
+"        h+=\"<div style='padding:12px 14px;background:#f8fafc'>\""
+"          +\"<div class='hint' style='margin:0 0 8px'>\"+t('claimable_hint')+\"</div>\""
+"          +\"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\\\"\"+mac+\"\\\")'>\""
+"          +t('claim_btn')+\"</button></div>\";"
+"      }"
 "      h+=\"</div>\";"
 "    });"
 "    box.innerHTML=h;"
 "    order.forEach(function(mac){"
 "      var id=mac.replace(/:/g,'');"
-"      wirePresets(document.getElementById('cd-mode-'+id),"
-"                  document.getElementById('cd-preset-'+id),"
-"                  document.getElementById('cd-addr-'+id));"
+"      var ms=document.getElementById('cd-mode-'+id);"
+"      if(ms){wirePresets(ms,document.getElementById('cd-preset-'+id),"
+"                         document.getElementById('cd-addr-'+id))}"
 "    });"
 "  }).catch(function(){box.innerHTML='<div class=\"loading\">'+t('failed_load')+'</div>'});"
 "}"
@@ -1581,6 +1627,29 @@ static const char *html_page =
 "  fetch('/setapcfg',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hidden='+h+'&maxconn='+encodeURIComponent(c)+'&txpower='+encodeURIComponent(p)})"
 "  .then(function(r){return r.text().then(function(x){m.innerHTML=r.ok?t('applied'):(t('rejected')+': '+x)})})"
 "  .finally(function(){btn.innerText=t('save_apctl_btn');loadApCfg()});"
+"}"
+"function loadDevPolicy(){"
+"  return fetch('/api/devices').then(function(r){return r.json()}).then(function(d){"
+"    document.getElementById('pol-claim').checked=!!d.guest_claim;"
+"    document.getElementById('pol-clrvis').checked=!!d.clear_on_visit;"
+"  }).catch(function(){});"
+"}"
+"function saveDevPolicy(){"
+"  var m=document.getElementById('settings-msg');"
+"  var c=document.getElementById('pol-claim').checked?'1':'0';"
+"  var v=document.getElementById('pol-clrvis').checked?'1':'0';"
+"  fetch('/setdevpolicy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'claim='+c+'&clearvisit='+v})"
+"  .then(function(r){ m.innerHTML=r.ok?t('saved'):t('failed'); loadDevPolicy() })"
+"  .catch(function(){ m.innerHTML=t('failed') });"
+"}"
+"function aclClaim(mac){"
+"  fetch('/claim',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'mac='+encodeURIComponent(mac)})"
+"  .then(function(r){ return r.text().then(function(x){"
+"    if(!r.ok){ alert(t('rejected')+': '+x) }"
+"    loadGuestView();"
+"  }) });"
 "}"
 "function loadAcl(){"
 "  var box=document.getElementById('acl-list');"
@@ -2379,18 +2448,27 @@ static esp_err_t devices_get_handler(httpd_req_t *req)
     bool have_me = caller_mac(req, me);
 
     cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "guest_claim", devices_guest_claim_enabled());
+    cJSON_AddBoolToObject(root, "clear_on_visit", devices_clear_iot_on_visit());
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < n; i++) {
-        if (!admin) {
-            if (!have_me || !devices_visible(all[i].mac, me)) {
-                continue;
-            }
+        bool mine = have_me && devices_visible(all[i].mac, me);
+        if (!admin && (!have_me || !devices_listed_for_guest(all[i].mac, me))) {
+            continue;
         }
         cJSON *o = cJSON_CreateObject();
         char b[18];
         snprintf(b, sizeof(b), MACSTR, MAC2STR(all[i].mac));
         cJSON_AddStringToObject(o, "mac", b);
         cJSON_AddBoolToObject(o, "iot", all[i].iot);
+        /* For a guest: whether this is one it could claim right now, or one it
+         * already holds and may release. */
+        /* "Unowned and IoT", i.e. claimable by anyone - not "claimable by the
+         * caller". Tying it to the caller made it read false for an admin, which
+         * is misleading rather than useful. */
+        cJSON_AddBoolToObject(o, "claimable",
+                              all[i].iot && !devices_mac_is_set(all[i].owner));
+        cJSON_AddBoolToObject(o, "mine", mine);
         if (devices_mac_is_set(all[i].owner)) {
             snprintf(b, sizeof(b), MACSTR, MAC2STR(all[i].owner));
             cJSON_AddStringToObject(o, "owner", b);
@@ -2414,6 +2492,90 @@ static esp_err_t devices_get_handler(httpd_req_t *req)
     httpd_resp_send(req, json, strlen(json));
     free((void *)json);
     cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/*
+ * Claim or release an unowned IoT device. Guest-reachable on purpose: it is how a
+ * visitor is given something to manage without logging in.
+ *
+ * The three refusals matter as much as the success path - only unowned devices
+ * can be claimed, so one visitor cannot take a device another already manages;
+ * only the current owner may release one; and nothing happens at all unless an
+ * administrator has enabled claiming.
+ */
+static esp_err_t claim_post_handler(httpd_req_t *req)
+{
+    if (!devices_guest_claim_enabled()) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "claiming is disabled");
+        return ESP_FAIL;
+    }
+    uint8_t me[6] = {0};
+    if (!caller_mac(req, me)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "your device is not on this network");
+        return ESP_FAIL;
+    }
+
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw[64] = {0}, mac_s[32] = {0};
+    if (httpd_query_key_value(buf, "mac", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mac required");
+        return ESP_FAIL;
+    }
+    url_decode(mac_s, sizeof(mac_s), raw);
+    uint8_t target[6];
+    if (!parse_mac(mac_s, target)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad MAC");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = devices_claim(target, me);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "already owned by someone else");
+        return ESP_FAIL;
+    }
+    if (err == ESP_ERR_INVALID_ARG) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "not an IoT device you can claim");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/* Admin only: the two ownership policies. */
+static esp_err_t set_devpolicy_post_handler(httpd_req_t *req)
+{
+    char buf[128] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_claim[8] = {0}, raw_clr[8] = {0};
+    if (httpd_query_key_value(buf, "claim", raw_claim, sizeof(raw_claim)) == ESP_OK) {
+        devices_set_guest_claim(raw_claim[0] == '1' || strcasecmp(raw_claim, "true") == 0);
+    }
+    if (httpd_query_key_value(buf, "clearvisit", raw_clr, sizeof(raw_clr)) == ESP_OK) {
+        devices_set_clear_iot_on_visit(raw_clr[0] == '1' || strcasecmp(raw_clr, "true") == 0);
+    }
+    httpd_resp_sendstr(req, "OK");
     return ESP_OK;
 }
 
@@ -3084,11 +3246,15 @@ static esp_err_t clients_get_handler(httpd_req_t *req)
     cJSON *arr = cJSON_CreateArray();
     int64_t now_us = esp_timer_get_time();
     for (int i = 0; i < n; i++) {
-        /* A guest sees its own device and the IoT devices it owns; an admin
-         * sees everything. Filtering here rather than refusing the request keeps
-         * one endpoint serving both roles. */
-        if (!caller_may_touch(req, list[i].mac)) {
-            continue;
+        /* A guest sees its own device, the IoT devices it owns, and unowned IoT
+         * devices it is allowed to claim - it has to see one before it can claim
+         * it. An admin sees everything. Filtering here rather than refusing the
+         * request keeps one endpoint serving both roles. */
+        if (web_auth_role_of(req) != WEB_ROLE_ADMIN) {
+            uint8_t me[6] = {0};
+            if (!caller_mac(req, me) || !devices_listed_for_guest(list[i].mac, me)) {
+                continue;
+            }
         }
         cJSON *o = cJSON_CreateObject();
         char mac[18];
@@ -3266,7 +3432,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 56;
+    cfg.max_uri_handlers = 60;
     cfg.stack_size = 6144;
     /*
      * Purge the least-recently-used session when the socket pool is full.
@@ -3326,6 +3492,8 @@ static void start_http_server(void)
         { { .uri = "/setssid",          .method = HTTP_POST }, set_ssid_post_handler, true },
         { { .uri = "/api/devices",  .method = HTTP_GET  }, devices_get_handler, false },
         { { .uri = "/device/set",   .method = HTTP_POST }, set_device_post_handler, true },
+        { { .uri = "/claim",        .method = HTTP_POST }, claim_post_handler, false },
+        { { .uri = "/setdevpolicy", .method = HTTP_POST }, set_devpolicy_post_handler, true },
 
         { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
         { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },

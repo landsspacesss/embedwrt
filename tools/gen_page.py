@@ -184,6 +184,13 @@ input:focus,select:focus{border-color:#3b82f6}
     <div id='acl-list' style='margin-top:12px'></div>
     <div id='acl-msg' class='hint' style='margin-top:10px'></div>
 
+    <h2 data-i18n='sec_policy'>Device ownership</h2>
+    <div class='form-group'><label><input type='checkbox' id='pol-claim' style='width:auto;margin-right:6px'><span data-i18n='guest_claim_label'></span></label>
+      <div class='hint' style='margin:6px 0 0' data-i18n='guest_claim_hint'></div></div>
+    <div class='form-group'><label><input type='checkbox' id='pol-clrvis' style='width:auto;margin-right:6px'><span data-i18n='clear_visit_label'></span></label>
+      <div class='hint' style='margin:6px 0 0' data-i18n='clear_visit_hint'></div></div>
+    <button class='btn' onclick='saveDevPolicy()' data-i18n='save_btn'>SAVE</button>
+
     <h2 data-i18n='sec_about'>About</h2>
     <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>
     <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>
@@ -239,7 +246,7 @@ en:{
  acl_add_btn:'ADD MAC',acl_enable_btn:'ENFORCE LIST',acl_disable_btn:'STOP ENFORCING',
  acl_empty:'No MACs allowed yet.',acl_my_mac:'Your MAC',
  sec_about:'About',mdns_name:'mDNS name',save_mdns_btn:'SAVE NAME',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',
- loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',guest_devices:'Devices you can manage',device_offline:'offline',
+ loading:'Loading...',no_clients:'No clients',cfg_btn:'Settings',iot_label:'IoT device',iot_hint:'An IoT device can be managed by its owner without logging in.',owner_label:'Owner',owner_none:'(unowned)',save_dev_btn:'SAVE',claim_btn:'Claim',release_btn:'Release',sec_policy:'Device ownership',guest_claim_label:'Allow visitors to claim unowned IoT devices',guest_claim_hint:'A visitor can take an unowned IoT device without logging in, and release it again. Only unowned ones, so one visitor cannot take a device another already manages.',clear_visit_label:'Drop the IoT flag when that device opens the panel',clear_visit_hint:'Anything able to open a web UI is not a dumb IoT device. Only affects the device that visits.',claimable_hint:'Unowned - a visitor may claim this.',your_device:'Your device',guest_devices:'Devices you can manage',device_offline:'offline',
  login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',
  login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',
  login_failed:'Wrong user or password',login_ok:'Signed in',
@@ -294,7 +301,7 @@ zh:{
  acl_add_btn:'添加 MAC',acl_enable_btn:'启用名单',acl_disable_btn:'停止过滤',
  acl_empty:'尚未添加任何 MAC。',acl_my_mac:'本机 MAC',
  sec_about:'关于',mdns_name:'mDNS 名称',save_mdns_btn:'保存名称',footer_line:'EmbedWRT &middot; ESP32-S3 &middot; GPL v3',
- loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',guest_devices:'你可以管理的设备',device_offline:'离线',
+ loading:'加载中...',no_clients:'暂无客户端',cfg_btn:'设置',iot_label:'物联网设备',iot_hint:'标记为物联网设备后，其主人无需登录即可管理它。',owner_label:'主人',owner_none:'（未指派）',save_dev_btn:'保存',claim_btn:'认领',release_btn:'放弃',sec_policy:'设备归属',guest_claim_label:'允许访客认领无主的物联网设备',guest_claim_hint:'访客无需登录即可认领无主的物联网设备，也可以放弃。只限无主的，所以不会抢走别人已在管理的设备。',clear_visit_label:'该设备打开面板时自动取消其物联网标记',clear_visit_hint:'能自己打开网页的就不算哑设备。只影响访问面板的那台设备本身。',claimable_hint:'无主 - 访客可以认领。',your_device:'你的设备',guest_devices:'你可以管理的设备',device_offline:'离线',
  login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',
  login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',
  login_failed:'用户名或密码错误',login_ok:'已登录',
@@ -389,7 +396,7 @@ function runSequential(fns,gen){
   return p;
 }
 function loadSettings(gen){
-  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,
+  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,loadDevPolicy,
                         loadLeases,loadDnsRules,loadPortmaps,loadHostname],gen);
 }
 function init(){
@@ -569,17 +576,20 @@ function cdSaveDevice(mac,id){
                          :('<span style="color:#b91c1c">'+t('rejected')+': '+x+'</span>')}
   })});
 }
-/* The guest's own devices: its own entry plus the IoT devices it owns. Driven by
-   /api/devices (which includes offline ones) unioned with /api/clients (which has
-   the live info), since a device can be owned while not currently associated. */
+/* The guest's devices: its own entry, the IoT devices it owns, and - when
+   claiming is enabled - unowned IoT devices it could take. Driven by /api/devices
+   (which knows the claim flags and includes offline devices) unioned with
+   /api/clients (which has the live hostname and address). */
 function loadGuestView(){
   var box=document.getElementById('guest-devices');
   box.innerHTML='<div class="loading">'+t('loading')+'</div>';
   fetchSeq(['/api/devices','/api/clients','/api/leases','/api/dnsrules']).then(function(res){
     var D=res[0]||{},C=res[1]||[],L=res[2]||{},R=res[3]||{};
+    var me=D.me||'';
+    var rec={};(D.devices||[]).forEach(function(d){rec[d.mac]=d});
     var live={};C.forEach(function(c){live[c.mac]=c});
     var seen={},order=[];
-    function add(mac){if(mac&&!seen[mac]){seen[mac]=1;order.push(mac)}}
+    function add(m){if(m&&!seen[m]){seen[m]=1;order.push(m)}}
     (D.devices||[]).forEach(function(d){add(d.mac)});
     C.forEach(function(c){add(c.mac)});
     if(!order.length){
@@ -589,7 +599,11 @@ function loadGuestView(){
     var h="<h2>"+t('guest_devices')+"</h2>";
     order.forEach(function(mac){
       var id=mac.replace(/:/g,'');
+      var d=rec[mac]||{};
       var c=live[mac];
+      var isSelf=(mac===me);
+      var editable=!!d.mine;              /* the server applies the same rule */
+      var claimable=!!d.claimable;
       var lease=null;(L.leases||[]).forEach(function(x){if(x.mac===mac){lease=x}});
       var rule=null;(R.rules||[]).forEach(function(x){if(x.mac===mac){rule=x}});
       var head=(c&&c.host)?c.host:t('unknown');
@@ -599,17 +613,32 @@ function loadGuestView(){
         +"<span class='mono' style='font-size:12px'>"+mac+"</span>"
         +"<span style='font-size:12px;color:"+(c?'#15803d':'#94a3b8')+"'>"
         +(c?(c.ip||'?'):t('device_offline'))+"</span></div>";
-      h+="<div style='font-size:12px;color:#475569;margin-top:3px'>"+head+"</div>";
+      h+="<div style='font-size:12px;color:#475569;margin-top:3px'>"+head
+        +(isSelf?(' &middot; <b>'+t('your_device')+'</b>'):'')+"</div>";
       h+="</div>";
-      h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');
+      if(editable){
+        h+=deviceEditHtml(id,mac,lease,rule,L,c?c.ip:'');
+        /* An owned IoT device: its holder may hand it back. */
+        if(d.iot&&d.owner===me&&!isSelf){
+          h+="<div style='padding:0 14px 12px;background:#f8fafc'>"
+            +"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\""+mac+"\")'>"
+            +t('release_btn')+"</button></div>";
+        }
+      }else if(claimable){
+        /* Not ours to edit, but shown so it can be claimed. */
+        h+="<div style='padding:12px 14px;background:#f8fafc'>"
+          +"<div class='hint' style='margin:0 0 8px'>"+t('claimable_hint')+"</div>"
+          +"<button class='refresh-btn' style='width:100%' onclick='aclClaim(\""+mac+"\")'>"
+          +t('claim_btn')+"</button></div>";
+      }
       h+="</div>";
     });
     box.innerHTML=h;
     order.forEach(function(mac){
       var id=mac.replace(/:/g,'');
-      wirePresets(document.getElementById('cd-mode-'+id),
-                  document.getElementById('cd-preset-'+id),
-                  document.getElementById('cd-addr-'+id));
+      var ms=document.getElementById('cd-mode-'+id);
+      if(ms){wirePresets(ms,document.getElementById('cd-preset-'+id),
+                         document.getElementById('cd-addr-'+id))}
     });
   }).catch(function(){box.innerHTML='<div class="loading">'+t('failed_load')+'</div>'});
 }
@@ -879,6 +908,29 @@ function saveApCfg(){
   fetch('/setapcfg',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'hidden='+h+'&maxconn='+encodeURIComponent(c)+'&txpower='+encodeURIComponent(p)})
   .then(function(r){return r.text().then(function(x){m.innerHTML=r.ok?t('applied'):(t('rejected')+': '+x)})})
   .finally(function(){btn.innerText=t('save_apctl_btn');loadApCfg()});
+}
+function loadDevPolicy(){
+  return fetch('/api/devices').then(function(r){return r.json()}).then(function(d){
+    document.getElementById('pol-claim').checked=!!d.guest_claim;
+    document.getElementById('pol-clrvis').checked=!!d.clear_on_visit;
+  }).catch(function(){});
+}
+function saveDevPolicy(){
+  var m=document.getElementById('settings-msg');
+  var c=document.getElementById('pol-claim').checked?'1':'0';
+  var v=document.getElementById('pol-clrvis').checked?'1':'0';
+  fetch('/setdevpolicy',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'claim='+c+'&clearvisit='+v})
+  .then(function(r){ m.innerHTML=r.ok?t('saved'):t('failed'); loadDevPolicy() })
+  .catch(function(){ m.innerHTML=t('failed') });
+}
+function aclClaim(mac){
+  fetch('/claim',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'mac='+encodeURIComponent(mac)})
+  .then(function(r){ return r.text().then(function(x){
+    if(!r.ok){ alert(t('rejected')+': '+x) }
+    loadGuestView();
+  }) });
 }
 function loadAcl(){
   var box=document.getElementById('acl-list');
