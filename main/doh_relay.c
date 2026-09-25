@@ -187,7 +187,8 @@ typedef struct {
     int sock;
     bool started;
     volatile bool time_synced;
-    volatile int last_path; /* 0 unknown, 1 doh, 2 plain, 3 servfail */
+    volatile int last_default_path; /* the DEFAULT resolver's last outcome only */
+    volatile int last_path;         /* most recent query on any resolver */
     volatile uint32_t query_count;
     volatile uint32_t dropped;
     volatile uint32_t cached_count;
@@ -848,6 +849,13 @@ static void handle_job(doh_worker_t *w, const dns_job_t *job)
     }
 
     s_ctx.last_path = path;
+    /* /status reports the default resolver's health, because that is what an
+     * unconfigured device experiences and what the settings page is about. A
+     * per-device client's outcome must not overwrite it, or a device quietly
+     * falling back to plaintext would be masked by another client's DoT traffic. */
+    if (slot == DNS_DEFAULT_SLOT) {
+        s_ctx.last_default_path = path;
+    }
 
     if (n > 0) {
         sendto(s_ctx.sock, w->resp, n, 0,
@@ -977,6 +985,7 @@ esp_err_t doh_relay_set_url(const char *url)
          * query on the default slot sees the new address, tears the old
          * instance down and starts fresh - breaker included. */
         s_ctx.last_path = PATH_UNKNOWN;
+        s_ctx.last_default_path = PATH_UNKNOWN;
         ESP_LOGI(TAG, "default resolver set to %s", url);
     }
     return ESP_OK;
@@ -1183,13 +1192,10 @@ const char *doh_relay_mode(void)
     if (!s_ctx.time_synced) {
         return "fallback (waiting for clock)";
     }
-    if (s_ctx.last_path == PATH_PLAIN || s_ctx.last_path == PATH_SERVFAIL) {
+    if (s_ctx.last_default_path == PATH_PLAIN || s_ctx.last_default_path == PATH_SERVFAIL) {
         return "fallback (resolver failing)";
     }
-    if (s_ctx.last_path == PATH_DOT) {
-        return "per-device (DoT)";
-    }
-    if (s_ctx.last_path == PATH_DOH) {
+    if (s_ctx.last_default_path == PATH_DOH) {
         return "doh";
     }
     return "idle";

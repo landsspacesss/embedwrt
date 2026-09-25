@@ -20,6 +20,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "mdns.h"
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include "nvs_flash.h"
@@ -405,6 +406,88 @@ static void sta_reconnect_task(void *arg)
             ESP_LOGW(TAG_STA, "still not connected, retrying in %d ms", delay_ms);
         }
     }
+}
+
+/* ======================= mDNS ======================= */
+
+/*
+ * Advertise a name for the web interface.
+ *
+ * mDNS rather than an entry in our own DNS relay, for a specific reason: a name
+ * served by the relay would only resolve for clients whose queries go through
+ * it, and a device pinned to a per-device DoT or plaintext rule bypasses the
+ * relay entirely - so that approach would silently fail for exactly those
+ * clients. mDNS is a separate protocol on its own multicast port and is
+ * indifferent to which resolver a client uses.
+ *
+ * `.local` is the TLD RFC 6762 reserves for mDNS, so this is the correct use of
+ * it; serving `.local` from a unicast resolver would be a spec violation and
+ * misfires on mDNS-aware clients. Both netifs are covered by default (the
+ * component's PREDEF_NETIF_STA/AP default on): the station advertises this
+ * device's upstream address and the AP advertises 192.168.4.1.
+ */
+static char s_mdns_host[33] = "espwifi";
+
+static void load_mdns_host(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    size_t len = sizeof(s_mdns_host);
+    if (nvs_get_str(h, "mdns_host", s_mdns_host, &len) != ESP_OK) {
+        strncpy(s_mdns_host, "espwifi", sizeof(s_mdns_host) - 1);
+    }
+    nvs_close(h);
+}
+
+static void save_mdns_host(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "cannot open NVS to save the mDNS name");
+        return;
+    }
+    nvs_set_str(h, "mdns_host", s_mdns_host);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* A DNS label: letters, digits and hyphens, not starting or ending with one. */
+static bool valid_hostname(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n > 32) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-';
+        if (!ok) {
+            return false;
+        }
+        if (c == '-' && (i == 0 || i == n - 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void start_mdns(void)
+{
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "mdns_init failed; the name will not resolve");
+        return;
+    }
+    if (mdns_hostname_set(s_mdns_host) != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "mdns_hostname_set('%s') failed", s_mdns_host);
+        return;
+    }
+    /* Advertise the web interface too, so it shows up in mDNS service browsers
+     * rather than only resolving by name. */
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG_MAIN, "mDNS: http://%s.local/", s_mdns_host);
 }
 
 /* ======================= SNTP ======================= */
@@ -867,6 +950,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddStringToObject(root, "ssid", "");
     }
     cJSON_AddStringToObject(root, "doh", doh_relay_mode());
+    cJSON_AddStringToObject(root, "mdns", s_mdns_host);
 
     /* Link health: a repeater's throughput is bounded by the weaker of its two
      * radio links, so these belong next to the connection state. */
@@ -1190,6 +1274,66 @@ static esp_err_t del_lease_post_handler(httpd_req_t *req)
 static const char *mode_name(uint8_t mode)
 {
     return (mode == DNS_MODE_DOT) ? "dot" : (mode == DNS_MODE_PLAIN ? "dns" : "doh");
+}
+
+static esp_err_t hostname_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "hostname", s_mdns_host);
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s.local/", s_mdns_host);
+    cJSON_AddStringToObject(root, "url", url);
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_hostname_post_handler(httpd_req_t *req)
+{
+    char buf[96] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw[64] = {0};
+    if (httpd_query_key_value(buf, "hostname", raw, sizeof(raw)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hostname required");
+        return ESP_FAIL;
+    }
+    /* Larger than the 32-char limit on purpose: url_decode() is bounded, so a
+     * too-long name would otherwise be silently truncated to something valid
+     * and accepted, instead of being rejected as the user's input deserves. */
+    char name[64] = {0};
+    url_decode(name, sizeof(name), raw);
+
+    if (!valid_hostname(name)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "use letters, digits and hyphens only (not leading/trailing), up to 32 chars");
+        return ESP_FAIL;
+    }
+
+    strncpy(s_mdns_host, name, sizeof(s_mdns_host) - 1);
+    s_mdns_host[sizeof(s_mdns_host) - 1] = '\0';
+    save_mdns_host();
+
+    /* Apply live: mdns_hostname_set() announces the change, so no reboot. */
+    esp_err_t err = mdns_hostname_set(s_mdns_host);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MAIN, "mdns_hostname_set failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "could not apply");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG_MAIN, "mDNS name is now http://%s.local/", s_mdns_host);
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 static esp_err_t dnsrules_get_handler(httpd_req_t *req)
@@ -1756,7 +1900,7 @@ static esp_err_t reset_pass_handler(httpd_req_t *req)
 static void start_http_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 32;
+    cfg.max_uri_handlers = 36;
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
 
@@ -1783,6 +1927,8 @@ static void start_http_server(void)
         { .uri = "/lease/add",   .method = HTTP_POST, .handler = add_lease_post_handler },
         { .uri = "/lease/del",   .method = HTTP_POST, .handler = del_lease_post_handler },
         { .uri = "/api/dnsrules", .method = HTTP_GET,  .handler = dnsrules_get_handler },
+        { .uri = "/api/hostname", .method = HTTP_GET,  .handler = hostname_get_handler },
+        { .uri = "/sethostname",  .method = HTTP_POST, .handler = set_hostname_post_handler },
         { .uri = "/dnsrule/set",  .method = HTTP_POST, .handler = set_dnsrule_post_handler },
         { .uri = "/dnsrule/del",  .method = HTTP_POST, .handler = del_dnsrule_post_handler },
         { .uri = "/api/dnstest",  .method = HTTP_GET,  .handler = dnstest_get_handler },
@@ -1812,6 +1958,7 @@ void app_main(void)
 
     load_wifi_credentials();
     load_doh_url();
+    load_mdns_host();
     load_radio_settings();
 
     uint8_t mac[6];
@@ -1935,4 +2082,5 @@ void app_main(void)
 
     start_sntp();
     start_http_server();
+    start_mdns();
 }

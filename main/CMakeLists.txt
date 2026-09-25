@@ -12,5 +12,5 @@ idf_component_register(SRCS ${srcs}
                     INCLUDE_DIRS "."
                     PRIV_REQUIRES esp_wifi nvs_flash esp_event esp_netif esp_timer
                                   esp_http_client esp_http_server esp-tls mbedtls lwip
-                                  esp_driver_rmt
+                                  esp_driver_rmt espressif__mdns
                     EMBED_TXTFILES "certs/gsr5.pem")
