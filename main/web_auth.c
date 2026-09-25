@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -279,17 +280,39 @@ bool web_auth_client_ip(httpd_req_t *req, uint32_t *ip_out)
     if (fd < 0) {
         return false;
     }
-    struct sockaddr_in sa;
-    socklen_t slen = sizeof(sa);
-    memset(&sa, 0, sizeof(sa));
-    if (getpeername(fd, (struct sockaddr *)&sa, &slen) != 0) {
+
+    /*
+     * The peer may come back as an IPv4-mapped IPv6 address (family AF_INET6,
+     * "::ffff:a.b.c.d") rather than a plain AF_INET one, because the server's
+     * socket ends up dual-stack. Checking only for AF_INET here rejected every
+     * request, so no caller ever had an identity - which surfaced as guests
+     * seeing "this address is not a device on this network" no matter what they
+     * connected from. Both forms are handled now; a genuine IPv6 peer is not,
+     * since subscribers on this AP are IPv4 and cannot be mapped to a MAC.
+     */
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) {
+        ESP_LOGW(TAG, "getpeername failed: errno=%d", errno);
         return false;
     }
-    if (sa.sin_family != AF_INET) {
+
+    if (ss.ss_family == AF_INET) {
+        *ip_out = ((struct sockaddr_in *)&ss)->sin_addr.s_addr;
+        return true;
+    }
+    if (ss.ss_family == AF_INET6) {
+        const uint8_t *b = ((struct sockaddr_in6 *)&ss)->sin6_addr.s6_addr;
+        static const uint8_t v4map[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        if (slen >= sizeof(struct sockaddr_in6) && memcmp(b, v4map, sizeof(v4map)) == 0) {
+            memcpy(ip_out, b + 12, 4);
+            return true;
+        }
+        ESP_LOGD(TAG, "peer is a real IPv6 address; cannot map it to a client");
         return false;
     }
-    *ip_out = sa.sin_addr.s_addr;
-    return true;
+    return false;
 }
 
 void web_auth_cookie_for(const char *token, char *out, size_t cap)
