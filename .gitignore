@@ -4,9 +4,14 @@ build_*/
 sdkconfig
 sdkconfig.old
 
-# Component manager artifacts (fetched, not authored)
+# Component manager artifacts (fetched, not authored).
+#
+# dependencies.lock IS tracked, on purpose. It pins the exact component versions
+# so a CI release is built from the same ones as a local build; leaving it out
+# lets the runner resolve ^1.0.2 afresh and pull a version nobody tested, which
+# shows up as "works here, fails in CI" - or worse, as a firmware that differs
+# from the one that was verified.
 managed_components/
-dependencies.lock
 
 # Editor / tooling noise
 .cache/

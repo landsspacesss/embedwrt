@@ -1,0 +1,67 @@
+name: Release firmware
+
+# Build and publish from a tag, on GitHub's machines rather than the author's.
+#
+# Two reasons this lives here instead of in a local script. The release is
+# reproducible: the assets on the release page are built by CI from exactly the
+# tagged source, so anyone can check them against it. And the firmware feed the
+# devices poll stops depending on a machine in the author's house - which is the
+# failure that prompted this, a local release server being switched off.
+#
+# The workflow only needs PROJECT_VER and the tag to agree; make_release.py
+# enforces that, and refuses to publish if they do not.
+
+on:
+  push:
+    tags: ['v*']
+  # Lets a release be re-run by hand, e.g. after a transient network failure on
+  # the runner, without moving the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)publish, e.g. v1.2.0'
+        required: true
+
+# Required to create a release and upload its assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag must be present because make_release.py verifies it against
+          # PROJECT_VER, and a manual re-run needs the tag's commit, not the
+          # default branch head.
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          # release-vX.Y is the tag scheme Espressif publishes for the ESP-IDF
+          # release branches (tools/docker/README.md in the IDF tree). This
+          # project is developed against 6.1.
+          esp_idf_version: release-v6.1
+          target: esp32s3
+
+      # The action runs its build in a container without --user, so everything it
+      # wrote is owned by root. Later steps run as the runner user and cannot
+      # even read build/ without this.
+      - name: Take ownership of the build output
+        run: sudo chown -R "$(id -u):$(id -g)" .
+
+      - name: Install esptool
+        # Used to merge the bootloader, partition table and app into the single
+        # image a blank board is written from. The IDF container has its own
+        # esptool, but the merge happens in make_release.py on the runner.
+        run: python3 -m pip install --quiet esptool
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # make_release.py reads this to learn which tag it is publishing.
+          GITHUB_REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: python3 tools/make_release.py --from-tag

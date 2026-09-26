@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.environ.get("EMBEDWRT_REPO", "landsspacesss/embedwrt")
@@ -47,6 +48,27 @@ def gh(*args, **kw):
     own message rather than a bare exit code."""
     r = run(["gh", *args], **kw)
     return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def with_retry(fn, what, tries=4):
+    """Retry a network operation with a growing pause.
+
+    github.com is reachable only intermittently from some networks, while
+    api.github.com stays up. A push that dies halfway leaves a local tag with no
+    matching remote release, so retrying here is what keeps a release from
+    needing to be finished by hand.
+    """
+    last = ""
+    for i in range(tries):
+        ok, out = fn()
+        if ok:
+            return True, out
+        last = out
+        if i < tries - 1:
+            wait = 5 * (i + 1)
+            print(f"  {what} failed (attempt {i + 1}/{tries}), retrying in {wait}s...")
+            time.sleep(wait)
+    return False, last
 
 
 def project_version():
@@ -112,11 +134,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="do everything except push and upload")
     ap.add_argument("--notes", help="file to use as the release body instead of the generated one")
+    ap.add_argument("--from-tag", action="store_true",
+                    help="CI mode: the tag already exists (it triggered the run) and "
+                         "build/ is already populated, so skip tagging and pushing")
     args = ap.parse_args()
 
     ver = project_version()
-    tag = f"v{ver}"
+
+    if args.from_tag:
+        # CI mode: the tag already exists and triggered this run, so there is
+        # nothing to tag or push. GITHUB_REF_NAME is what the workflow was
+        # started for.
+        tag = os.environ.get("GITHUB_REF_NAME", "").strip()
+        if not tag:
+            sys.exit("FATAL: --from-tag needs GITHUB_REF_NAME (set by GitHub Actions)")
+    else:
+        tag = f"v{ver}"
+
     print(f"PROJECT_VER = {ver}   tag = {tag}")
+
+    # The tag and the source must agree. This is the failure the whole
+    # PROJECT_VER convention exists to prevent: tag it v1.2.0 while CMakeLists
+    # still says 1.1.1 and every device reports 1.1.1 forever, so no device ever
+    # considers itself out of date. Cheap to check, invisible if not checked.
+    if tag != f"v{ver}":
+        sys.exit(f"FATAL: tag '{tag}' does not match PROJECT_VER '{ver}'.\n"
+                 f"       Set PROJECT_VER to {tag.lstrip('v')} and rebuild, or tag v{ver}.")
 
     if not os.path.exists(APP_BIN):
         sys.exit(f"FATAL: {APP_BIN} missing - build first (idf.py build)")
@@ -127,17 +170,21 @@ def main():
                  f"       Rebuild before publishing, or the tag and the image disagree.")
     print(f"image descriptor version matches PROJECT_VER ({emb})")
 
-    # Refuse to publish a dirty tree: the tag would not describe what shipped.
-    st = run(["git", "status", "--porcelain"]).stdout.strip()
-    if st:
-        print("WARNING: working tree is dirty:")
-        print("  " + st.replace("\n", "\n  "))
+    if not args.from_tag:
+        # Refuse to publish a dirty tree: the tag would not describe what
+        # shipped. In CI the tree is a clean checkout, so this is local-only.
+        st = run(["git", "status", "--porcelain"]).stdout.strip()
+        if st:
+            print("WARNING: working tree is dirty:")
+            print("  " + st.replace("\n", "\n  "))
 
-    tag_exists = run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"]).returncode == 0
-    if tag_exists and not args.dry_run:
-        sys.exit(f"FATAL: tag {tag} already exists - bump PROJECT_VER for a new release")
-    if tag_exists:
-        print(f"note: tag {tag} already exists (fine for a dry run)")
+        # An existing tag is not fatal: a previous run may have stopped after
+        # tagging (the network here fails intermittently), and re-publishing the
+        # same version is the correct way to finish that. The guards that matter
+        # are PROJECT_VER matching the image and the remote assets being
+        # complete, both checked below and after upload.
+        if run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"]).returncode == 0:
+            print(f"note: tag {tag} already exists locally - will reuse it, not recreate")
 
     # The merged image is what a blank board gets written from 0x0.
     print("generating the merged full-flash image...")
@@ -173,23 +220,40 @@ def main():
     title = f"{tag}"
     body = open(args.notes, encoding="utf-8").read() if args.notes else release_body(ver, app_sha, full_sha)
 
-    print(f"tagging {tag}...")
-    if run(["git", "tag", "-a", tag, "-m", f"EmbedWRT {ver}"]).returncode != 0:
-        sys.exit("FATAL: git tag failed")
+    if not args.from_tag:
+        # Idempotent: a previous run may have died after tagging but before
+        # pushing (the network here fails intermittently), and recreating an
+        # existing tag is an error. Neither case should need manual cleanup.
+        if not run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"]).returncode == 0:
+            print(f"tagging {tag}...")
+            if run(["git", "tag", "-a", tag, "-m", f"EmbedWRT {ver}"]).returncode != 0:
+                sys.exit("FATAL: git tag failed")
+        else:
+            print(f"tag {tag} already exists locally, reusing it")
 
-    # The branch has to be on the remote before the tag, or the tag points at a
-    # commit the server cannot resolve. Publishing a tag without its commit is
-    # the state this got into once; the release page still works, which is what
-    # makes it easy to miss.
-    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     ok, out = gh("auth", "status")
     if not ok:
         sys.exit(f"FATAL: gh is not authenticated\n{out}")
 
-    for ref in (branch, tag):
-        r = run(["git", "push", "origin", ref])
-        if r.returncode != 0:
-            sys.exit(f"FATAL: pushing {ref} failed\n{r.stderr}")
+    # The branch has to be on the remote before the tag, or the tag points at a
+    # commit the server cannot resolve. Publishing a tag without its commit is
+    # the state this got into once; the release page still works, which is what
+    # makes it easy to miss. In CI the tag is already there by definition.
+    if args.from_tag:
+        print("CI mode: the tag triggered this run, so nothing to push")
+    else:
+        branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+
+        def push(ref):
+            def attempt():
+                r = run(["git", "push", "origin", ref])
+                return r.returncode == 0, (r.stderr or r.stdout).strip()
+            return attempt
+
+        for ref in (branch, tag):
+            ok, out = with_retry(push(ref), f"pushing {ref}")
+            if not ok:
+                sys.exit(f"FATAL: pushing {ref} failed after retries\n{out}")
 
     # gh refuses to attach a file whose name already exists in the release, so
     # the four assets are staged under the names the device expects rather than
@@ -203,18 +267,23 @@ def main():
               ("embedwrt.bin.sha256", f"{APP_BIN}.sha256"),
               ("embedwrt-full-16MB.bin.sha256", f"{FULL_BIN}.sha256")]
 
-    print("creating the release and uploading assets...")
-    with tempfile.TemporaryDirectory() as stage:
-        names = []
-        for name, path in assets:
-            dst = os.path.join(stage, name)
-            shutil.copyfile(path, dst)
-            names.append(dst)
-        ok, out = gh("release", "create", tag, "--repo", REPO,
-                     "--title", title, "--notes-file", "-", *names,
-                     input=body)
-    if not ok:
-        sys.exit(f"FATAL: creating the release failed\n{out}")
+    ok, existing = gh("release", "view", tag, "--repo", REPO, "--json", "tagName")
+    if ok:
+        print(f"release {tag} already exists, leaving it alone")
+    else:
+        print("creating the release and uploading assets...")
+        with tempfile.TemporaryDirectory() as stage:
+            names = []
+            for name, path in assets:
+                dst = os.path.join(stage, name)
+                shutil.copyfile(path, dst)
+                names.append(dst)
+            ok, out = with_retry(
+                lambda: gh("release", "create", "--repo", REPO, tag,
+                           "--title", title, "--notes-file", "-", *names, input=body),
+                "creating the release")
+        if not ok:
+            sys.exit(f"FATAL: creating the release failed\n{out}")
 
     # Read it back rather than trusting the upload: the device depends on these
     # assets being present and named exactly, and this is cheap.

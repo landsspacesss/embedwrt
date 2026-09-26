@@ -361,11 +361,12 @@ static int version_cmp(const char *a, const char *b)
 #define FW_MAX_REDIRECTS 4
 
 /*
- * A signed asset URL (what GitHub hands back for a release file) is around 550
- * characters of query string. 256 looked generous and would have truncated it
- * into a connection error with no useful explanation.
+ * A redirect target for a release asset is a signed object-storage URL, measured
+ * at 910-930 characters for real repositories. 256 looked generous and 1024 was
+ * still too tight; either would have truncated the URL into a connection error
+ * with no useful explanation.
  */
-#define FW_URL_MAX 1024
+#define FW_URL_MAX 2048
 
 typedef struct {
     bool     have_location;
@@ -398,8 +399,15 @@ static esp_err_t fw_http_event(esp_http_client_event_t *evt)
  * between the metadata fetch and the image download. The CA bundle is what
  * makes https work at all; without it every GitHub request fails at the
  * handshake.
+ *
+ * `accept` is set only for asset downloads. GitHub's per-asset API endpoint
+ * returns JSON metadata by default and the file itself only when asked for
+ * application/octet-stream - and that endpoint matters here because the
+ * friendlier browser_download_url lives on github.com, which is not always
+ * reachable from this network while api.github.com is.
  */
-static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t *cap)
+static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t *cap,
+                                             const char *accept)
 {
     esp_http_client_config_t cfg = {
         .url = url,
@@ -411,7 +419,11 @@ static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t
         .crt_bundle_attach = esp_crt_bundle_attach,
         .keep_alive_enable = true,
     };
-    return esp_http_client_init(&cfg);
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c != NULL && accept != NULL) {
+        esp_http_client_set_header(c, "Accept", accept);
+    }
+    return c;
 }
 
 /*
@@ -423,7 +435,8 @@ static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t
  * it again because the redirect target is a different host. That is why the
  * default check interval is a day rather than an hour.
  */
-static esp_err_t fw_http_get_open(const char *url, esp_http_client_handle_t *client_out,
+static esp_err_t fw_http_get_open(const char *url, const char *accept,
+                                  esp_http_client_handle_t *client_out,
                                   int64_t *len_out, int *status_out, char *err,
                                   size_t err_len)
 {
@@ -432,7 +445,7 @@ static esp_err_t fw_http_get_open(const char *url, esp_http_client_handle_t *cli
 
     for (int hop = 0; hop <= FW_MAX_REDIRECTS; hop++) {
         redirect_capture_t cap = {0};
-        esp_http_client_handle_t c = fw_http_open(cur, &cap);
+        esp_http_client_handle_t c = fw_http_open(cur, &cap, accept);
         if (c == NULL) {
             snprintf(err, err_len, "cannot create HTTP client");
             return ESP_FAIL;
@@ -490,7 +503,7 @@ static esp_err_t http_get_to_buf(const char *url, char *buf, size_t cap,
 {
     esp_http_client_handle_t c = NULL;
     int64_t clen = 0;
-    if (fw_http_get_open(url, &c, &clen, status_out, err, err_len) != ESP_OK) {
+    if (fw_http_get_open(url, NULL, &c, &clen, status_out, err, err_len) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -555,7 +568,10 @@ static esp_err_t ota_stream_url(const char *url, esp_ota_handle_t handle,
 {
     esp_http_client_handle_t c = NULL;
     int64_t clen = 0;
-    if (fw_http_get_open(url, &c, &clen, NULL, err, err_len) != ESP_OK) {
+    /* Asks GitHub's asset endpoint for the bytes rather than its JSON metadata;
+     * harmless for a plain file server. */
+    if (fw_http_get_open(url, "application/octet-stream", &c, &clen, NULL,
+                         err, err_len) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -654,6 +670,34 @@ done:
 
 /* ======================= check ======================= */
 
+/*
+ * Where to fetch one release asset from.
+ *
+ * GitHub offers two addresses per asset and they are not equivalent on this
+ * network. `browser_download_url` points at github.com, whose web front end may
+ * be blocked while api.github.com still answers. The per-asset API `url` stays
+ * on api.github.com and redirects to signed object storage - one extra hop, and
+ * it works when the other does not. So prefer it, but only for GitHub: other
+ * servers (a Gitea mirror) expose a `url` with different semantics that returns
+ * JSON metadata rather than the file.
+ */
+static const char *asset_fetch_url(const cJSON *asset)
+{
+    static const char GH_API[] = "https://api.github.com/";
+
+    const cJSON *u = cJSON_GetObjectItemCaseSensitive(asset, "url");
+    if (cJSON_IsString(u) && u->valuestring != NULL &&
+            strncmp(u->valuestring, GH_API, sizeof(GH_API) - 1) == 0) {
+        return u->valuestring;
+    }
+
+    const cJSON *b = cJSON_GetObjectItemCaseSensitive(asset, "browser_download_url");
+    if (cJSON_IsString(b) && b->valuestring != NULL) {
+        return b->valuestring;
+    }
+    return NULL;
+}
+
 static esp_err_t do_check(void)
 {
     set_state(FW_CHECKING, NULL);
@@ -723,10 +767,10 @@ static esp_err_t do_check(void)
         goto out;
     }
 
-    const cJSON *dl_url = cJSON_GetObjectItemCaseSensitive(dl, "browser_download_url");
-    const cJSON *sha_url = cJSON_GetObjectItemCaseSensitive(sha, "browser_download_url");
+    const char *dl_url = asset_fetch_url(dl);
+    const char *sha_url = asset_fetch_url(sha);
     const cJSON *size = cJSON_GetObjectItemCaseSensitive(dl, "size");
-    if (!cJSON_IsString(dl_url) || !cJSON_IsString(sha_url) ||
+    if (dl_url == NULL || sha_url == NULL ||
             !cJSON_IsNumber(size) || size->valuedouble <= 0) {
         set_state(FW_ERROR, "release metadata is incomplete");
         goto out;
@@ -743,8 +787,8 @@ static esp_err_t do_check(void)
         s_last_check_us = esp_timer_get_time();
         s_error[0] = '\0';
         if (cmp > 0) {
-            snprintf(s_dl_url, sizeof(s_dl_url), "%s", dl_url->valuestring);
-            snprintf(s_sha_url, sizeof(s_sha_url), "%s", sha_url->valuestring);
+            snprintf(s_dl_url, sizeof(s_dl_url), "%s", dl_url);
+            snprintf(s_sha_url, sizeof(s_sha_url), "%s", sha_url);
             s_img_size = (size_t)size->valuedouble;
             s_state = FW_AVAILABLE;
         } else {
