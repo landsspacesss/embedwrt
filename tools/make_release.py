@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish a firmware release to the private Gitea.
+"""Publish a firmware release to GitHub.
+
+The release feed the devices poll is GitHub, so this is where new versions have
+to land. A self-hosted mirror can be pointed at from the panel, but the default
+is GitHub for one reason: it is not a machine in this house that can be switched
+off.
 
 The version is read from PROJECT_VER in CMakeLists.txt rather than taken as an
 argument. That is deliberate: if the tag and the version compiled into the image
@@ -13,23 +18,20 @@ missing checksum makes it refuse the update silently rather than fail loudly.
     python3 tools/make_release.py            # publish PROJECT_VER
     python3 tools/make_release.py --dry-run  # show what would happen
 
-Needs the ESP-IDF environment sourced (for esptool) and a build already present.
+Needs `gh` authenticated, the ESP-IDF environment sourced (for esptool), and a
+build already present.
 """
 import argparse
-import base64
 import hashlib
-import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HOST = os.environ.get("GITEA_HOST", "http://192.168.0.105:3000")
-OWNER = os.environ.get("GITEA_OWNER", "claude_code")
-REPO_NAME = os.environ.get("GITEA_REPO", "embedwrt")
+REPO = os.environ.get("EMBEDWRT_REPO", "landsspacesss/embedwrt")
 
 APP_BIN = os.path.join(ROOT, "build", "embedwrt.bin")
 FULL_BIN = os.path.join(ROOT, "build", "embedwrt-full-16MB.bin")
@@ -38,6 +40,13 @@ PROJECT_VER_RE = re.compile(r'set\(PROJECT_VER\s+"([^"]+)"\)')
 
 def run(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, **kw)
+
+
+def gh(*args, **kw):
+    """Run gh and return (ok, stdout). Kept small so failures report the CLI's
+    own message rather than a bare exit code."""
+    r = run(["gh", *args], **kw)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
 def project_version():
@@ -60,31 +69,6 @@ def embedded_version(path):
     if at < 0:
         return None
     return d[at + 16:at + 48].split(b"\x00")[0].decode("utf-8", "replace")
-
-
-def credentials():
-    path = os.path.expanduser("~/.git-credentials")
-    for line in open(path, encoding="utf-8").read().splitlines():
-        if HOST.split("//")[-1].split(":")[0] in line:
-            m = re.match(r"https?://([^:]+):([^@]+)@(.+)", line)
-            if m:
-                return m.group(1), m.group(2)
-    sys.exit(f"FATAL: no credentials for {HOST} in ~/.git-credentials")
-
-
-def api(method, path, data=None, ctype="application/json"):
-    user, password = credentials()
-    auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
-    body = json.dumps(data).encode() if (data is not None and ctype == "application/json") else data
-    req = urllib.request.Request(HOST + path, data=body, method=method)
-    req.add_header("Authorization", auth)
-    req.add_header("Content-Type", ctype)
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            raw = r.read()
-            return r.status, (json.loads(raw) if raw else None)
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
 
 
 def sha256_file(path):
@@ -192,34 +176,59 @@ def main():
     print(f"tagging {tag}...")
     if run(["git", "tag", "-a", tag, "-m", f"EmbedWRT {ver}"]).returncode != 0:
         sys.exit("FATAL: git tag failed")
-    r = run(["git", "push", "origin", tag])
-    if r.returncode != 0:
-        sys.exit(f"FATAL: pushing the tag failed\n{r.stderr}")
 
-    print("creating the release...")
-    status, resp = api("POST", f"/api/v1/repos/{OWNER}/{REPO_NAME}/releases",
-                       {"tag_name": tag, "target_commitish": "master",
-                        "name": title, "body": body, "draft": False, "prerelease": False})
-    if status not in (200, 201):
-        sys.exit(f"FATAL: creating the release failed ({status}): {resp}")
-    rid = resp["id"]
-    print(f"  release id {rid}")
+    # The branch has to be on the remote before the tag, or the tag points at a
+    # commit the server cannot resolve. Publishing a tag without its commit is
+    # the state this got into once; the release page still works, which is what
+    # makes it easy to miss.
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    ok, out = gh("auth", "status")
+    if not ok:
+        sys.exit(f"FATAL: gh is not authenticated\n{out}")
 
-    assets = [(APP_BIN, "embedwrt.bin"),
-              (FULL_BIN, "embedwrt-full-16MB.bin"),
-              (f"{APP_BIN}.sha256", "embedwrt.bin.sha256"),
-              (f"{FULL_BIN}.sha256", "embedwrt-full-16MB.bin.sha256")]
-    for path, name in assets:
-        with open(path, "rb") as f:
-            data = f.read()
-        status, r = api("POST",
-                        f"/api/v1/repos/{OWNER}/{REPO_NAME}/releases/{rid}/assets?name={name}",
-                        data=data, ctype="application/octet-stream")
-        if status not in (200, 201):
-            sys.exit(f"FATAL: uploading {name} failed ({status}): {r}")
-        print(f"  uploaded {name} ({len(data)} bytes)")
+    for ref in (branch, tag):
+        r = run(["git", "push", "origin", ref])
+        if r.returncode != 0:
+            sys.exit(f"FATAL: pushing {ref} failed\n{r.stderr}")
 
-    print(f"\nreleased {tag}: {HOST}/{OWNER}/{REPO_NAME}/releases/tag/{tag}")
+    # gh refuses to attach a file whose name already exists in the release, so
+    # the four assets are staged under the names the device expects rather than
+    # their on-disk paths.
+    #
+    # embedwrt.bin.sha256 is the one that matters most: the updater will not
+    # flash an image it cannot verify, and a release missing that asset fails
+    # silently - the device just reports it has nothing to install.
+    assets = [("embedwrt.bin", APP_BIN),
+              ("embedwrt-full-16MB.bin", FULL_BIN),
+              ("embedwrt.bin.sha256", f"{APP_BIN}.sha256"),
+              ("embedwrt-full-16MB.bin.sha256", f"{FULL_BIN}.sha256")]
+
+    print("creating the release and uploading assets...")
+    with tempfile.TemporaryDirectory() as stage:
+        names = []
+        for name, path in assets:
+            dst = os.path.join(stage, name)
+            shutil.copyfile(path, dst)
+            names.append(dst)
+        ok, out = gh("release", "create", tag, "--repo", REPO,
+                     "--title", title, "--notes-file", "-", *names,
+                     input=body)
+    if not ok:
+        sys.exit(f"FATAL: creating the release failed\n{out}")
+
+    # Read it back rather than trusting the upload: the device depends on these
+    # assets being present and named exactly, and this is cheap.
+    ok, out = gh("release", "view", tag, "--repo", REPO, "--json", "assets")
+    if not ok:
+        sys.exit(f"FATAL: created the release but cannot read it back\n{out}")
+    import json as _json
+    names = sorted(a["name"] for a in _json.loads(out)["assets"])
+    expected = sorted(n for n, _ in assets)
+    if names != expected:
+        sys.exit(f"FATAL: assets do not match.\n  expected {expected}\n  got      {names}")
+
+    print(f"\nreleased {tag} with {len(names)} assets")
+    print(f"  https://github.com/{REPO}/releases/tag/{tag}")
 
 
 if __name__ == "__main__":

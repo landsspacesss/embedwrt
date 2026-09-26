@@ -31,10 +31,11 @@ exposes JSON endpoints for every subsystem (`/api/clients`, `/api/leases`,
 resolver appears broken: it runs a real query through each configured resolver
 using the same code the relay serves clients with.
 
-The device is reachable three ways, which is convenient for testing:
-`http://192.168.0.110/` from the upstream LAN, `http://192.168.4.1/` from a client
-on its own AP, and `http://espwifi.local/` via mDNS. The upstream address comes
-from DHCP and *changes*; find it by MAC `a4:cb:8f:c6:7b:ac` rather than assuming.
+The device is reachable three ways, which is convenient for testing: from the
+upstream LAN (whatever address DHCP handed it), `http://192.168.4.1/` from a
+client on its own AP, and `http://espwifi.local/` via mDNS. The upstream address
+*changes*; find it by the station MAC rather than assuming a fixed address. The
+MAC is printed at boot (`wifi:mode : sta (...)`) and reported by `/api/status`.
 
 `sdkconfig` is **gitignored**; `sdkconfig.defaults` is the source of truth. After
 editing it, delete `sdkconfig` and rebuild, otherwise the regenerated config keeps

@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "psa/crypto.h"
 
 #include "fw_update.h"
@@ -29,15 +30,21 @@
 #define NVS_KEY_URL      "ota_url"   /* str: Gitea "latest release" endpoint */
 
 /*
- * Where to ask by default. This points at the releases/latest endpoint of a
- * Gitea instance rather than at a file, so publishing a release is all it takes
- * to make a new version visible - no firmware change, no URL to edit.
+ * Where to ask by default. A "latest release" endpoint rather than a file, so
+ * publishing a release is all it takes to make a new version visible - no
+ * firmware change and no URL to edit.
  *
- * Overridable from the panel, which is what makes the device usable on another
- * network or after the repository moves.
+ * GitHub rather than a LAN server for two reasons: it is not a machine in this
+ * house that can be switched off, and the repository is public so no token is
+ * involved (the endpoint is readable anonymously). Unauthenticated GitHub API
+ * access allows 60 requests an hour per address; one check a day is far below
+ * that.
+ *
+ * Overridable from the panel, so a fork, another network or a self-hosted
+ * mirror all work without rebuilding.
  */
 #define DEFAULT_URL \
-    "http://192.168.0.105:3000/api/v1/repos/claude_code/embedwrt/releases/latest"
+    "https://api.github.com/repos/landsspacesss/embedwrt/releases/latest"
 
 /*
  * Cap on the release metadata. Gitea returns the whole release including its
@@ -253,10 +260,16 @@ esp_err_t fw_update_set_url(const char *url)
     if (url == NULL || url[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-    /* Only ever fetched over plain HTTP: this device has no TLS server side and
-     * the resolver it talks to is a LAN host. Refusing other schemes keeps a
-     * typo from turning into an unsupported-client error at check time. */
-    if (strncmp(url, "http://", 7) != 0) {
+    /*
+     * http or https. https is what a public feed needs (GitHub has no plain
+     * HTTP endpoint), and it costs about two seconds of handshake per
+     * connection on this chip - acceptable for a once-a-day check, and the
+     * reason a LAN mirror is still worth allowing.
+     *
+     * Anything else is refused so that a typo surfaces here rather than as an
+     * unsupported-protocol error at check time.
+     */
+    if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) {
         return ESP_ERR_INVALID_ARG;
     }
     if (strlen(url) >= sizeof(s_url)) {
@@ -342,6 +355,129 @@ static int version_cmp(const char *a, const char *b)
 }
 
 /*
+ * Keeps a redirect chain short but not so short that GitHub's does not fit:
+ * api.github.com -> the asset host, and sometimes one more hop.
+ */
+#define FW_MAX_REDIRECTS 4
+
+/*
+ * A signed asset URL (what GitHub hands back for a release file) is around 550
+ * characters of query string. 256 looked generous and would have truncated it
+ * into a connection error with no useful explanation.
+ */
+#define FW_URL_MAX 1024
+
+typedef struct {
+    bool     have_location;
+    char     location[FW_URL_MAX];
+} redirect_capture_t;
+
+/*
+ * Captures the Location header of a 3xx reply.
+ *
+ * This has to be done by hand. Automatic redirects are only followed inside
+ * esp_http_client_perform(), which buffers the whole body - unusable for a
+ * 1.2 MB image - so the streaming open/read path has to notice a 3xx and ask
+ * for the new URL itself. With disable_auto_redirect set, the client dispatches
+ * the headers and nothing else.
+ */
+static esp_err_t fw_http_event(esp_http_client_event_t *evt)
+{
+    redirect_capture_t *cap = evt->user_data;
+    if (cap != NULL && evt->event_id == HTTP_EVENT_ON_HEADER &&
+            evt->header_key != NULL && evt->header_value != NULL &&
+            strcasecmp(evt->header_key, "Location") == 0) {
+        snprintf(cap->location, sizeof(cap->location), "%s", evt->header_value);
+        cap->have_location = true;
+    }
+    return ESP_OK;
+}
+
+/*
+ * One place where a request is configured, so the TLS settings cannot drift
+ * between the metadata fetch and the image download. The CA bundle is what
+ * makes https work at all; without it every GitHub request fails at the
+ * handshake.
+ */
+static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t *cap)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = FW_HTTP_TIMEOUT_MS,
+        .disable_auto_redirect = true,   /* we follow them ourselves, see below */
+        .event_handler = fw_http_event,
+        .user_data = cap,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .keep_alive_enable = true,
+    };
+    return esp_http_client_init(&cfg);
+}
+
+/*
+ * Follow up to FW_MAX_REDIRECTS hops, returning a client already open on a 200
+ * reply (or an error). `*client_out` is always valid on success and must be
+ * closed by the caller.
+ *
+ * HTTPS costs roughly two seconds of handshake on this chip, and each hop pays
+ * it again because the redirect target is a different host. That is why the
+ * default check interval is a day rather than an hour.
+ */
+static esp_err_t fw_http_get_open(const char *url, esp_http_client_handle_t *client_out,
+                                  int64_t *len_out, int *status_out, char *err,
+                                  size_t err_len)
+{
+    char cur[FW_URL_MAX];
+    snprintf(cur, sizeof(cur), "%s", url);
+
+    for (int hop = 0; hop <= FW_MAX_REDIRECTS; hop++) {
+        redirect_capture_t cap = {0};
+        esp_http_client_handle_t c = fw_http_open(cur, &cap);
+        if (c == NULL) {
+            snprintf(err, err_len, "cannot create HTTP client");
+            return ESP_FAIL;
+        }
+
+        if (esp_http_client_open(c, 0) != ESP_OK) {
+            esp_http_client_cleanup(c);
+            snprintf(err, err_len, "cannot connect");
+            return ESP_FAIL;
+        }
+
+        int64_t clen = esp_http_client_fetch_headers(c);
+        int status = esp_http_client_get_status_code(c);
+
+        if (status == 200) {
+            *client_out = c;
+            *len_out = clen;
+            if (status_out) {
+                *status_out = status;
+            }
+            return ESP_OK;
+        }
+
+        bool is_redirect = (status == 301 || status == 302 || status == 303 ||
+                            status == 307 || status == 308);
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+
+        if (!is_redirect) {
+            snprintf(err, err_len, "server returned %d", status);
+            return ESP_FAIL;
+        }
+        if (!cap.have_location) {
+            snprintf(err, err_len, "redirect %d without a Location header", status);
+            return ESP_FAIL;
+        }
+        snprintf(cur, sizeof(cur), "%s", cap.location);
+        ESP_LOGI(TAG, "redirect %d -> %s", status, cur);
+    }
+
+    snprintf(err, err_len, "too many redirects");
+    return ESP_FAIL;
+}
+
+/*
  * Streamed GET into a caller buffer.
  *
  * esp_http_client_perform() (used by the DoH relay) would work for the small
@@ -352,34 +488,13 @@ static esp_err_t http_get_to_buf(const char *url, char *buf, size_t cap,
                                  size_t *out_len, int *status_out, char *err,
                                  size_t err_len)
 {
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = FW_HTTP_TIMEOUT_MS,
-        .disable_auto_redirect = true,
-        /* Plain HTTP on purpose: no cert_pem, no crt_bundle_attach. */
-    };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) {
-        snprintf(err, err_len, "cannot create HTTP client");
+    esp_http_client_handle_t c = NULL;
+    int64_t clen = 0;
+    if (fw_http_get_open(url, &c, &clen, status_out, err, err_len) != ESP_OK) {
         return ESP_FAIL;
     }
 
     esp_err_t ret = ESP_FAIL;
-    if (esp_http_client_open(c, 0) != ESP_OK) {
-        snprintf(err, err_len, "cannot connect");
-        goto done;
-    }
-
-    int64_t clen = esp_http_client_fetch_headers(c);
-    int status = esp_http_client_get_status_code(c);
-    if (status_out) {
-        *status_out = status;
-    }
-    if (status != 200) {
-        snprintf(err, err_len, "server returned %d", status);
-        goto done;
-    }
     /*
      * esp_http_client_fetch_headers returns 0 when the reply has no
      * content-length header *or* is chunked - and chunked is exactly what this
@@ -438,15 +553,9 @@ static esp_err_t ota_stream_url(const char *url, esp_ota_handle_t handle,
                                 uint8_t digest_out[32], size_t expected,
                                 fw_ota_result_t *result, char *err, size_t err_len)
 {
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = HTTP_METHOD_GET,
-        .timeout_ms = FW_HTTP_TIMEOUT_MS,
-        .disable_auto_redirect = true,
-    };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == NULL) {
-        snprintf(err, err_len, "cannot create HTTP client");
+    esp_http_client_handle_t c = NULL;
+    int64_t clen = 0;
+    if (fw_http_get_open(url, &c, &clen, NULL, err, err_len) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -456,16 +565,6 @@ static esp_err_t ota_stream_url(const char *url, esp_ota_handle_t handle,
     char *buf = NULL;
     size_t total = 0;
 
-    if (esp_http_client_open(c, 0) != ESP_OK) {
-        snprintf(err, err_len, "cannot connect");
-        goto done;
-    }
-    int64_t clen = esp_http_client_fetch_headers(c);
-    int status = esp_http_client_get_status_code(c);
-    if (status != 200) {
-        snprintf(err, err_len, "server returned %d", status);
-        goto done;
-    }
     if (clen > 0 && (size_t)clen != expected) {
         /* The release metadata said one size and the file says another; trust
          * neither and stop before writing. */
