@@ -140,3 +140,42 @@ esp_err_t fw_update_set_url(const char *url);
  * this module from reaching into the router's event group.
  */
 void fw_update_set_online(bool online);
+
+/* ======================= developer mode ======================= */
+
+/*
+ * A token that authorizes flashing without a panel session, for scripted or
+ * automated updates.
+ *
+ * Off by default, and deliberately narrow: a valid token authorizes only the
+ * firmware-update endpoints, not the panel as a whole, so a leaked token cannot
+ * read the client list or change WiFi settings. It is the most powerful
+ * credential on the device for the little it can do either way, which is why
+ * enabling it is a separate, explicit switch rather than something that comes
+ * on with the web panel.
+ *
+ * Presented in an X-OTA-Token header rather than a query parameter: URLs end up
+ * in logs and referrers, headers do not.
+ *
+ * Over plain HTTP, like the panel password, so it is readable by anyone who can
+ * observe the LAN. That is the same exposure the session cookie already has.
+ */
+
+/* Token length: 32 random bytes rendered as hex, plus the terminator. */
+#define FW_DEV_TOKEN_LEN 65
+
+bool fw_dev_mode(void);
+esp_err_t fw_set_dev_mode(bool on);
+
+/* Current token, or "" when none has been generated. Never NULL. */
+void fw_dev_token(char *out, size_t out_len);
+
+/* Replace the token with a fresh random one. */
+esp_err_t fw_dev_token_regen(void);
+
+/*
+ * True when `presented` matches the current token and developer mode is on.
+ * Compared without an early exit, so a wrong guess cannot be narrowed down by
+ * how long the comparison took.
+ */
+bool fw_dev_token_ok(const char *presented);

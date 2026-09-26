@@ -27,7 +27,14 @@
 #define NVS_NAMESPACE "storage"
 #define NVS_KEY_INTERVAL "otachk"    /* u32 hours; 0 = periodic checks off */
 #define NVS_KEY_AUTO     "otaauto"   /* u8: install without asking */
-#define NVS_KEY_URL      "ota_url"   /* str: Gitea "latest release" endpoint */
+#define NVS_KEY_URL      "ota_url"   /* str: release feed endpoint */
+#define NVS_KEY_DEVMODE  "devmode"   /* u8: token-authorized flashing */
+#define NVS_KEY_DEVTOK   "devtoken"  /* str: 64 hex chars */
+
+/* Own key, not a field in a record blob: growing a blob fails its size check
+ * on load and silently wipes it. */
+static bool s_dev_mode;
+static char s_dev_token[FW_DEV_TOKEN_LEN];
 
 /*
  * Where to ask by default. A "latest release" endpoint rather than a file, so
@@ -208,10 +215,18 @@ static void load_settings(void)
     if (nvs_get_str(h, NVS_KEY_URL, s_url, &len) != ESP_OK || s_url[0] == '\0') {
         snprintf(s_url, sizeof(s_url), "%s", DEFAULT_URL);
     }
+    if (nvs_get_u8(h, NVS_KEY_DEVMODE, &u8) == ESP_OK) {
+        s_dev_mode = (u8 != 0);
+    }
+    len = sizeof(s_dev_token);
+    if (nvs_get_str(h, NVS_KEY_DEVTOK, s_dev_token, &len) != ESP_OK) {
+        s_dev_token[0] = '\0';
+    }
     nvs_close(h);
 
-    ESP_LOGI(TAG, "check every %u h, auto-install %s",
-             (unsigned)s_interval_hours, s_auto_install ? "on" : "off");
+    ESP_LOGI(TAG, "check every %u h, auto-install %s, developer mode %s",
+             (unsigned)s_interval_hours, s_auto_install ? "on" : "off",
+             s_dev_mode ? "ENABLED" : "off");
 }
 
 esp_err_t fw_update_set_interval(uint32_t hours)
@@ -300,6 +315,118 @@ void fw_update_set_online(bool online)
     } else {
         xEventGroupClearBits(s_eg, UPD_ONLINE_BIT);
     }
+}
+
+/* ======================= developer mode ======================= */
+
+/* 32 random bytes as lowercase hex. */
+static void gen_token(char *out)
+{
+    uint8_t raw[32];
+    static const char hex[] = "0123456789abcdef";
+
+    esp_fill_random(raw, sizeof(raw));
+    for (size_t i = 0; i < sizeof(raw); i++) {
+        out[i * 2]     = hex[raw[i] >> 4];
+        out[i * 2 + 1] = hex[raw[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+static esp_err_t save_dev_settings(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    nvs_set_u8(h, NVS_KEY_DEVMODE, s_dev_mode ? 1 : 0);
+    nvs_set_str(h, NVS_KEY_DEVTOK, s_dev_token);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+bool fw_dev_mode(void)
+{
+    return s_dev_mode;
+}
+
+void fw_dev_token(char *out, size_t out_len)
+{
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    /*
+     * The web server starts before this module is initialised, so a request can
+     * arrive with no mutex yet. Nothing can be writing then either, so reading
+     * without it is correct rather than merely convenient.
+     */
+    if (s_lock == NULL) {
+        snprintf(out, out_len, "%s", s_dev_token);
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    snprintf(out, out_len, "%s", s_dev_token);
+    xSemaphoreGive(s_lock);
+}
+
+esp_err_t fw_dev_token_regen(void)
+{
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char fresh[FW_DEV_TOKEN_LEN];
+    gen_token(fresh);
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    snprintf(s_dev_token, sizeof(s_dev_token), "%s", fresh);
+    xSemaphoreGive(s_lock);
+
+    ESP_LOGW(TAG, "developer token replaced");
+    return save_dev_settings();
+}
+
+esp_err_t fw_set_dev_mode(bool on)
+{
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_dev_mode = on;
+    /* A mode with no token would be unusable, so mint one the first time it is
+     * switched on rather than making the panel do it in a second step. */
+    bool need_token = (on && s_dev_token[0] == '\0');
+    if (need_token) {
+        gen_token(s_dev_token);
+    }
+    xSemaphoreGive(s_lock);
+
+    if (need_token) {
+        ESP_LOGW(TAG, "developer mode enabled; a token was generated");
+    } else {
+        ESP_LOGW(TAG, "developer mode %s", on ? "ENABLED" : "off");
+    }
+    return save_dev_settings();
+}
+
+bool fw_dev_token_ok(const char *presented)
+{
+    if (!s_dev_mode || presented == NULL || s_dev_token[0] == '\0') {
+        return false;
+    }
+    /* Both are fixed-length hex, so a differing length is not secret. */
+    if (strlen(presented) != strlen(s_dev_token)) {
+        return false;
+    }
+    /* No early exit: the time taken must not reveal how much of the token
+     * matched. With 256 bits of entropy brute force is hopeless anyway, but a
+     * comparison that leaks prefix length is the kind of thing that gets
+     * reused somewhere it matters. */
+    unsigned char diff = 0;
+    for (size_t i = 0; s_dev_token[i] != '\0'; i++) {
+        diff |= (unsigned char)presented[i] ^ (unsigned char)s_dev_token[i];
+    }
+    return diff == 0;
 }
 
 /* ======================= helpers ======================= */

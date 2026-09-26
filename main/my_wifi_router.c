@@ -190,6 +190,11 @@ typedef struct {
     httpd_uri_t uri;                       /* handler/user_ctx filled in at registration */
     esp_err_t (*real)(httpd_req_t *);
     bool admin_only;                       /* guests get 401 instead of the handler */
+    /* Also acceptable with the developer token instead of a session. Only the
+     * firmware-update routes set this, so a leaked token cannot do anything
+     * beyond flashing. Trailing and almost always omitted, so C zero-fills it
+     * and only the routes that want it have to say so. */
+    bool token_ok;
 } route_t;
 
 /*
@@ -216,6 +221,34 @@ static bool caller_may_touch(httpd_req_t *req, const uint8_t target[6])
     }
     uint8_t me[6] = {0};
     return caller_mac(req, me) && devices_visible(target, me);
+}
+
+/*
+ * Developer mode: does this request carry the token?
+ *
+ * Called only for routes that opted in, so it does not need to know which
+ * endpoints matter. A missing header is the ordinary case and must not be
+ * logged as a failure, or a guest hitting an OTA route would fill the console.
+ */
+static bool developer_token_authorized(httpd_req_t *req)
+{
+    if (!fw_dev_mode()) {
+        return false;
+    }
+    if (httpd_req_get_hdr_value_len(req, "X-OTA-Token") != FW_DEV_TOKEN_LEN - 1) {
+        return false;
+    }
+    char presented[FW_DEV_TOKEN_LEN];
+    if (httpd_req_get_hdr_value_str(req, "X-OTA-Token", presented,
+                                    sizeof(presented)) != ESP_OK) {
+        return false;
+    }
+    if (!fw_dev_token_ok(presented)) {
+        ESP_LOGW(TAG_MAIN, "developer token presented but wrong");
+        return false;
+    }
+    ESP_LOGW(TAG_MAIN, "%s authorized by developer token", req->uri);
+    return true;
 }
 
 /* ======================= route authorization ======================= */
@@ -256,6 +289,15 @@ static esp_err_t auth_trampoline(httpd_req_t *req)
     }
 
     if (r->admin_only && web_auth_role_of(req) != WEB_ROLE_ADMIN) {
+        /*
+         * Developer mode: a token in a header stands in for a session, but only
+         * on the routes that opted in (the firmware-update ones) and only while
+         * the mode is switched on. Reading the header is cheap and the token
+         * comparison does not leak, so a wrong token costs nothing.
+         */
+        if (r->token_ok && developer_token_authorized(req)) {
+            return r->real(req);
+        }
         /* 401 rather than 403: the caller can fix this by logging in, and the
          * UI keys its login prompt off exactly this status. */
         httpd_resp_set_status(req, "401 Unauthorized");
@@ -952,6 +994,21 @@ static const char *html_page =
 "    <div class='hint' style='margin:8px 0 0' data-i18n='fw_ap_note'></div>"
 "    <div id='fw-msg' class='hint' style='margin-top:8px'></div>"
 ""
+"    <h2 data-i18n='sec_dev'>Developer mode</h2>"
+"    <div class='hint' style='margin:0 0 10px' data-i18n='dev_intro'></div>"
+"    <div class='form-group'><label><input type='checkbox' id='dev-on' style='width:auto;margin-right:6px'><span data-i18n='dev_enable'></span></label>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='dev_warn'></div></div>"
+"    <div class='form-group'><label data-i18n='dev_token_label'></label>"
+"      <input type='text' id='dev-token' class='mono' readonly placeholder='-'>"
+"      <div class='hint' style='margin:6px 0 0' data-i18n='dev_token_hint'></div></div>"
+"    <div class='row'>"
+"      <div><button class='btn' onclick='saveDevMode()' data-i18n='save_btn'>SAVE</button></div>"
+"      <div><button class='btn danger' id='dev-regen' onclick='regenDevToken()' data-i18n='dev_regen_btn'>NEW TOKEN</button></div>"
+"    </div>"
+"    <div class='form-group'><label data-i18n='dev_cmd_label'></label>"
+"      <input type='text' id='dev-cmd' class='mono' readonly></div>"
+"    <div id='dev-msg' class='hint' style='margin-top:8px'></div>"
+""
 "    <h2 data-i18n='sec_about'>About</h2>"
 "    <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>"
 "    <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>"
@@ -1028,6 +1085,17 @@ static const char *html_page =
 " ota_lastcheck:'Last checked',ota_never:'never',ota_failed:'Update check failed',"
 " ota_ago_min:'{n} min ago',ota_ago_hour:'{n} h ago',ota_ago_day:'{n} d ago',"
 " ota_install_confirm:'Install the new firmware and restart? Every client will drop.',"
+" sec_dev:'Developer mode',"
+" dev_intro:'Lets a script flash firmware without logging in, by presenting a token in a request header.',"
+" dev_enable:'Allow firmware updates with a token instead of a login',"
+" dev_warn:'The token can replace the firmware, which is the most powerful thing this device does. It is sent in the clear, like the panel password, so anyone who can watch the network can read it. Leave this off unless you are automating updates.',"
+" dev_token_label:'Token',dev_token_hint:'Stored on the device. Generate a new one if it leaks.',"
+" dev_regen_btn:'NEW TOKEN',"
+" dev_cmd_label:'Example',"
+" dev_off:'Developer mode is off. Enable it to get a token.',"
+" dev_on:'Developer mode is on. Anyone with the token can flash this device.',"
+" dev_token_changed:'New token generated. Update anything using the old one.',"
+" dev_need_on:'Enable developer mode first.',"
 " login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',"
 " login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',"
 " login_failed:'Wrong user or password',login_ok:'Signed in',"
@@ -1102,6 +1170,17 @@ static const char *html_page =
 " ota_lastcheck:'上次检查',ota_never:'从未',ota_failed:'检查更新失败',"
 " ota_ago_min:'{n} 分钟前',ota_ago_hour:'{n} 小时前',ota_ago_day:'{n} 天前',"
 " ota_install_confirm:'确定安装新固件并重启？所有客户端都会断开。',"
+" sec_dev:'开发者模式',"
+" dev_intro:'允许脚本在请求头里附带令牌，无需登录即可刷写固件。',"
+" dev_enable:'允许用令牌（而非登录）更新固件',"
+" dev_warn:'令牌可以直接替换固件，这是本设备权限最高的操作。它和面板密码一样是明文传输的，能监听网络的人就能读到。除非你要做自动化更新，否则保持关闭。',"
+" dev_token_label:'令牌',dev_token_hint:'保存在设备上。若泄漏请生成新的。',"
+" dev_regen_btn:'生成新令牌',"
+" dev_cmd_label:'示例',"
+" dev_off:'开发者模式已关闭。启用后会生成令牌。',"
+" dev_on:'开发者模式已开启。持有令牌的人都能刷写本设备。',"
+" dev_token_changed:'已生成新令牌。请更新所有使用旧令牌的地方。',"
+" dev_need_on:'请先启用开发者模式。',"
 " login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',"
 " login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',"
 " login_failed:'用户名或密码错误',login_ok:'已登录',"
@@ -1196,7 +1275,8 @@ static const char *html_page =
 "}"
 "function loadSettings(gen){"
 "  return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,loadDevPolicy,"
-"                        loadLeases,loadDnsRules,loadPortmaps,loadHostname,loadFwInfo],gen);"
+"                        loadLeases,loadDnsRules,loadPortmaps,loadHostname,loadFwInfo,"
+"                        loadDevMode],gen);"
 "}"
 "function init(){"
 "  fetch('/status').then(function(r){return r.json()}).then(function(d){"
@@ -1948,6 +2028,56 @@ static const char *html_page =
 "  /* Kept as the name the settings chain calls; the data now comes from"
 "     /api/update so a page load makes one request, not two. */"
 "  return loadUpdateInfo();"
+"}"
+"function devCmdText(token){"
+"  /* The header has to be spelled out: the token is not a cookie, so a plain"
+"     browser URL will not work and the example is the documentation. */"
+"  var u=location.protocol+'//'+location.host+'/ota';"
+"  return 'curl -X POST --data-binary @embedwrt.bin -H \"Content-Type: application/octet-stream\"'"
+"    +' -H \"X-OTA-Token: '+(token||'<token>')+'\" '+u;"
+"}"
+"function renderDevMode(d){"
+"  /* Note: never name a local 't' here. t() is the translation helper, and"
+"     shadowing it turns every later lookup into a call on a DOM element -"
+"     which fails at runtime, not at generation time. */"
+"  var on=document.getElementById('dev-on');"
+"  if(on){on.checked=!!d.enabled}"
+"  var tok=document.getElementById('dev-token');"
+"  if(tok){tok.value=d.token||''}"
+"  var c=document.getElementById('dev-cmd');"
+"  if(c){c.value=devCmdText(d.token)}"
+"  var m=document.getElementById('dev-msg');"
+"  if(m&&!m.innerHTML){m.innerHTML=d.enabled?t('dev_on'):t('dev_off')}"
+"  var r=document.getElementById('dev-regen');"
+"  if(r){r.disabled=!d.enabled}"
+"}"
+"function loadDevMode(){"
+"  return fetch('/api/devmode').then(function(r){return r.json()}).then(function(d){"
+"    renderDevMode(d);"
+"  }).catch(function(){});"
+"}"
+"function saveDevMode(){"
+"  var m=document.getElementById('dev-msg');"
+"  var on=document.getElementById('dev-on').checked?'1':'0';"
+"  fetch('/setdevmode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'on='+on})"
+"  .then(function(r){return r.text().then(function(x){"
+"    if(!r.ok){m.innerHTML='<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>';return}"
+"    m.innerHTML='<span style=\"color:#15803d\">'+t('saved')+'</span>';"
+"    loadDevMode();"
+"  })}).catch(function(){m.innerHTML=t('failed')});"
+"}"
+"function regenDevToken(){"
+"  var m=document.getElementById('dev-msg');"
+"  if(!document.getElementById('dev-on').checked){m.innerHTML='<span style=\"color:#b45309\">'+t('dev_need_on')+'</span>';return}"
+"  if(!confirm(t('dev_regen_btn')+'?')){return}"
+"  fetch('/setdevmode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+"        body:'regen=1'})"
+"  .then(function(r){return r.text().then(function(x){"
+"    if(!r.ok){m.innerHTML='<span style=\"color:#b91c1c\">'+t('rejected')+': '+x+'</span>';return}"
+"    m.innerHTML='<span style=\"color:#15803d\">'+t('dev_token_changed')+'</span>';"
+"    loadDevMode();"
+"  })}).catch(function(){m.innerHTML=t('failed')});"
 "}"
 "/* Waits out the restart, then reports. The delay before the first poll matters:"
 "   the response to the upload arrives while the OLD firmware is still running and"
@@ -3240,6 +3370,63 @@ static esp_err_t set_otacfg_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ==================== developer mode (token flashing) ==================== */
+
+/*
+ * The token is returned here in full. It has to be, so the panel can show it to
+ * the administrator to put in a script; there is no way to script a flash
+ * without knowing it. This endpoint is admin-only and is NOT itself
+ * token-authorized, so holding the token does not let you read it back - which
+ * also means a token cannot be used to extend its own life.
+ */
+static esp_err_t devmode_get_handler(httpd_req_t *req)
+{
+    char token[FW_DEV_TOKEN_LEN];
+    fw_dev_token(token, sizeof(token));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", fw_dev_mode());
+    cJSON_AddStringToObject(root, "token", token);
+    cJSON_AddStringToObject(root, "header", "X-OTA-Token");
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t set_devmode_post_handler(httpd_req_t *req)
+{
+    char buf[96] = {0};
+    size_t want = (req->content_len < sizeof(buf) - 1) ? req->content_len : sizeof(buf) - 1;
+    int ret = httpd_req_recv(req, buf, want);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    char raw_on[8] = {0}, raw_regen[8] = {0};
+    if (httpd_query_key_value(buf, "on", raw_on, sizeof(raw_on)) == ESP_OK) {
+        fw_set_dev_mode(raw_on[0] == '1' || strcasecmp(raw_on, "true") == 0);
+    }
+    if (httpd_query_key_value(buf, "regen", raw_regen, sizeof(raw_regen)) == ESP_OK &&
+            (raw_regen[0] == '1' || strcasecmp(raw_regen, "true") == 0)) {
+        /* Only meaningful while the mode is on; rotating a token nobody can use
+         * would just be a confusing way to say "nothing happened". */
+        if (!fw_dev_mode()) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "enable developer mode before rotating the token");
+            return ESP_FAIL;
+        }
+        fw_dev_token_regen();
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
 static esp_err_t session_get_handler(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -4054,57 +4241,62 @@ static void start_http_server(void)
     /* Static, because httpd_register_uri_handler stores the user_ctx pointer and
      * it has to outlive this call. */
     static route_t routes[] = {
-        { { .uri = "/",                 .method = HTTP_GET }, root_get_handler, false },
-        { { .uri = "/status",           .method = HTTP_GET }, status_get_handler, true },
-        { { .uri = "/scan",             .method = HTTP_GET }, scan_get_handler, true },
-        { { .uri = "/connect",          .method = HTTP_POST }, connect_post_handler, true },
-        { { .uri = "/api/appass",       .method = HTTP_GET }, ap_pass_get_handler, true },
-        { { .uri = "/setpass",          .method = HTTP_POST }, set_pass_post_handler, true },
-        { { .uri = "/resetpass",        .method = HTTP_POST }, reset_pass_handler, true },
-        { { .uri = "/api/dohurl",       .method = HTTP_GET }, doh_url_get_handler, true },
-        { { .uri = "/setdohurl",        .method = HTTP_POST }, set_doh_url_post_handler, true },
-        { { .uri = "/api/clients",      .method = HTTP_GET }, clients_get_handler, false },
-        { { .uri = "/api/radio",        .method = HTTP_GET }, radio_get_handler, true },
-        { { .uri = "/setradio",         .method = HTTP_POST }, set_radio_post_handler, true },
-        { { .uri = "/api/leases",       .method = HTTP_GET }, leases_get_handler, false },
-        { { .uri = "/lease/add",        .method = HTTP_POST }, add_lease_post_handler, false },
-        { { .uri = "/lease/del",        .method = HTTP_POST }, del_lease_post_handler, false },
-        { { .uri = "/api/dnsrules",     .method = HTTP_GET }, dnsrules_get_handler, false },
-        { { .uri = "/api/hostname",     .method = HTTP_GET }, hostname_get_handler, true },
-        { { .uri = "/sethostname",      .method = HTTP_POST }, set_hostname_post_handler, true },
-        { { .uri = "/dnsrule/set",      .method = HTTP_POST }, set_dnsrule_post_handler, false },
-        { { .uri = "/dnsrule/del",      .method = HTTP_POST }, del_dnsrule_post_handler, false },
-        { { .uri = "/api/dnstest",      .method = HTTP_GET }, dnstest_get_handler, true },
-        { { .uri = "/api/portmaps",     .method = HTTP_GET }, portmaps_get_handler, true },
-        { { .uri = "/portmap/add",      .method = HTTP_POST }, add_portmap_post_handler, true },
-        { { .uri = "/portmap/del",      .method = HTTP_POST }, del_portmap_post_handler, true },
-        { { .uri = "/api/ssid",         .method = HTTP_GET }, ssid_get_handler, true },
-        { { .uri = "/api/apcfg",        .method = HTTP_GET }, apcfg_get_handler, true },
-        { { .uri = "/setapcfg",         .method = HTTP_POST }, set_apcfg_post_handler, true },
-        { { .uri = "/api/acl",          .method = HTTP_GET }, acl_get_handler, true },
-        { { .uri = "/acl/add",          .method = HTTP_POST }, acl_add_post_handler, true },
-        { { .uri = "/acl/del",          .method = HTTP_POST }, acl_del_post_handler, true },
-        { { .uri = "/acl/enable",       .method = HTTP_POST }, acl_enable_post_handler, true },
-        { { .uri = "/setssid",          .method = HTTP_POST }, set_ssid_post_handler, true },
-        { { .uri = "/api/devices",  .method = HTTP_GET  }, devices_get_handler, false },
-        { { .uri = "/device/set",   .method = HTTP_POST }, set_device_post_handler, true },
-        { { .uri = "/claim",        .method = HTTP_POST }, claim_post_handler, false },
-        { { .uri = "/setdevpolicy", .method = HTTP_POST }, set_devpolicy_post_handler, true },
+        { { .uri = "/",                 .method = HTTP_GET }, root_get_handler, false, false },
+        { { .uri = "/status",           .method = HTTP_GET }, status_get_handler, true, false },
+        { { .uri = "/scan",             .method = HTTP_GET }, scan_get_handler, true, false },
+        { { .uri = "/connect",          .method = HTTP_POST }, connect_post_handler, true, false },
+        { { .uri = "/api/appass",       .method = HTTP_GET }, ap_pass_get_handler, true, false },
+        { { .uri = "/setpass",          .method = HTTP_POST }, set_pass_post_handler, true, false },
+        { { .uri = "/resetpass",        .method = HTTP_POST }, reset_pass_handler, true, false },
+        { { .uri = "/api/dohurl",       .method = HTTP_GET }, doh_url_get_handler, true, false },
+        { { .uri = "/setdohurl",        .method = HTTP_POST }, set_doh_url_post_handler, true, false },
+        { { .uri = "/api/clients",      .method = HTTP_GET }, clients_get_handler, false, false },
+        { { .uri = "/api/radio",        .method = HTTP_GET }, radio_get_handler, true, false },
+        { { .uri = "/setradio",         .method = HTTP_POST }, set_radio_post_handler, true, false },
+        { { .uri = "/api/leases",       .method = HTTP_GET }, leases_get_handler, false, false },
+        { { .uri = "/lease/add",        .method = HTTP_POST }, add_lease_post_handler, false, false },
+        { { .uri = "/lease/del",        .method = HTTP_POST }, del_lease_post_handler, false, false },
+        { { .uri = "/api/dnsrules",     .method = HTTP_GET }, dnsrules_get_handler, false, false },
+        { { .uri = "/api/hostname",     .method = HTTP_GET }, hostname_get_handler, true, false },
+        { { .uri = "/sethostname",      .method = HTTP_POST }, set_hostname_post_handler, true, false },
+        { { .uri = "/dnsrule/set",      .method = HTTP_POST }, set_dnsrule_post_handler, false, false },
+        { { .uri = "/dnsrule/del",      .method = HTTP_POST }, del_dnsrule_post_handler, false, false },
+        { { .uri = "/api/dnstest",      .method = HTTP_GET }, dnstest_get_handler, true, false },
+        { { .uri = "/api/portmaps",     .method = HTTP_GET }, portmaps_get_handler, true, false },
+        { { .uri = "/portmap/add",      .method = HTTP_POST }, add_portmap_post_handler, true, false },
+        { { .uri = "/portmap/del",      .method = HTTP_POST }, del_portmap_post_handler, true, false },
+        { { .uri = "/api/ssid",         .method = HTTP_GET }, ssid_get_handler, true, false },
+        { { .uri = "/api/apcfg",        .method = HTTP_GET }, apcfg_get_handler, true, false },
+        { { .uri = "/setapcfg",         .method = HTTP_POST }, set_apcfg_post_handler, true, false },
+        { { .uri = "/api/acl",          .method = HTTP_GET }, acl_get_handler, true, false },
+        { { .uri = "/acl/add",          .method = HTTP_POST }, acl_add_post_handler, true, false },
+        { { .uri = "/acl/del",          .method = HTTP_POST }, acl_del_post_handler, true, false },
+        { { .uri = "/acl/enable",       .method = HTTP_POST }, acl_enable_post_handler, true, false },
+        { { .uri = "/setssid",          .method = HTTP_POST }, set_ssid_post_handler, true, false },
+        { { .uri = "/api/devices",  .method = HTTP_GET  }, devices_get_handler, false, false },
+        { { .uri = "/device/set",   .method = HTTP_POST }, set_device_post_handler, true, false },
+        { { .uri = "/claim",        .method = HTTP_POST }, claim_post_handler, false, false },
+        { { .uri = "/setdevpolicy", .method = HTTP_POST }, set_devpolicy_post_handler, true, false },
 
         /* Firmware update. Admin-only: this rewrites the boot partition, and
-         * the automatic updater pulls executable code off the network. */
-        { { .uri = "/api/version",  .method = HTTP_GET  }, version_get_handler, true },
-        { { .uri = "/ota",          .method = HTTP_POST }, ota_post_handler, true },
-        { { .uri = "/api/update",   .method = HTTP_GET  }, update_get_handler, true },
-        { { .uri = "/ota/check",    .method = HTTP_POST }, ota_check_post_handler, true },
-        { { .uri = "/ota/install",  .method = HTTP_POST }, ota_install_post_handler, true },
-        { { .uri = "/setotacfg",    .method = HTTP_POST }, set_otacfg_post_handler, true },
+         * the automatic updater pulls executable code off the network.
+         *
+         * The three OTA routes also accept the developer token, so a script can
+         * flash without a panel session. Nothing else does - see route_t. */
+        { { .uri = "/api/version",  .method = HTTP_GET  }, version_get_handler, true, false },
+        { { .uri = "/ota",          .method = HTTP_POST }, ota_post_handler,      true, true  },
+        { { .uri = "/api/update",   .method = HTTP_GET  }, update_get_handler,    true, false },
+        { { .uri = "/ota/check",    .method = HTTP_POST }, ota_check_post_handler,true, true  },
+        { { .uri = "/ota/install",  .method = HTTP_POST }, ota_install_post_handler,true, true },
+        { { .uri = "/setotacfg",    .method = HTTP_POST }, set_otacfg_post_handler,true, false },
+        { { .uri = "/api/devmode",  .method = HTTP_GET  }, devmode_get_handler,   true, false },
+        { { .uri = "/setdevmode",   .method = HTTP_POST }, set_devmode_post_handler,true,false },
 
-        { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false },
-        { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false },
-        { { .uri = "/logout",           .method = HTTP_POST }, logout_post_handler, false },
-        { { .uri = "/api/webauth",      .method = HTTP_GET }, webauth_get_handler, true },
-        { { .uri = "/setwebauth",       .method = HTTP_POST }, set_webauth_post_handler, true },
+        { { .uri = "/api/session",      .method = HTTP_GET }, session_get_handler, false, false },
+        { { .uri = "/login",            .method = HTTP_POST }, login_post_handler, false, false },
+        { { .uri = "/logout",           .method = HTTP_POST }, logout_post_handler, false, false },
+        { { .uri = "/api/webauth",      .method = HTTP_GET }, webauth_get_handler, true, false },
+        { { .uri = "/setwebauth",       .method = HTTP_POST }, set_webauth_post_handler, true, false },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

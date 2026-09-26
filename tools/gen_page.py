@@ -223,6 +223,21 @@ input:focus,select:focus{border-color:#3b82f6}
     <div class='hint' style='margin:8px 0 0' data-i18n='fw_ap_note'></div>
     <div id='fw-msg' class='hint' style='margin-top:8px'></div>
 
+    <h2 data-i18n='sec_dev'>Developer mode</h2>
+    <div class='hint' style='margin:0 0 10px' data-i18n='dev_intro'></div>
+    <div class='form-group'><label><input type='checkbox' id='dev-on' style='width:auto;margin-right:6px'><span data-i18n='dev_enable'></span></label>
+      <div class='hint' style='margin:6px 0 0' data-i18n='dev_warn'></div></div>
+    <div class='form-group'><label data-i18n='dev_token_label'></label>
+      <input type='text' id='dev-token' class='mono' readonly placeholder='-'>
+      <div class='hint' style='margin:6px 0 0' data-i18n='dev_token_hint'></div></div>
+    <div class='row'>
+      <div><button class='btn' onclick='saveDevMode()' data-i18n='save_btn'>SAVE</button></div>
+      <div><button class='btn danger' id='dev-regen' onclick='regenDevToken()' data-i18n='dev_regen_btn'>NEW TOKEN</button></div>
+    </div>
+    <div class='form-group'><label data-i18n='dev_cmd_label'></label>
+      <input type='text' id='dev-cmd' class='mono' readonly></div>
+    <div id='dev-msg' class='hint' style='margin-top:8px'></div>
+
     <h2 data-i18n='sec_about'>About</h2>
     <div class='form-group'><label data-i18n='mdns_name'>mDNS name</label><input type='text' id='mdns-name'></div>
     <button class='btn' onclick='saveHostname()' data-i18n='save_mdns_btn'>SAVE NAME</button>
@@ -299,6 +314,17 @@ en:{
  ota_lastcheck:'Last checked',ota_never:'never',ota_failed:'Update check failed',
  ota_ago_min:'{n} min ago',ota_ago_hour:'{n} h ago',ota_ago_day:'{n} d ago',
  ota_install_confirm:'Install the new firmware and restart? Every client will drop.',
+ sec_dev:'Developer mode',
+ dev_intro:'Lets a script flash firmware without logging in, by presenting a token in a request header.',
+ dev_enable:'Allow firmware updates with a token instead of a login',
+ dev_warn:'The token can replace the firmware, which is the most powerful thing this device does. It is sent in the clear, like the panel password, so anyone who can watch the network can read it. Leave this off unless you are automating updates.',
+ dev_token_label:'Token',dev_token_hint:'Stored on the device. Generate a new one if it leaks.',
+ dev_regen_btn:'NEW TOKEN',
+ dev_cmd_label:'Example',
+ dev_off:'Developer mode is off. Enable it to get a token.',
+ dev_on:'Developer mode is on. Anyone with the token can flash this device.',
+ dev_token_changed:'New token generated. Update anything using the old one.',
+ dev_need_on:'Enable developer mode first.',
  login_btn:'Log in',logout_btn:'Log out',login_title:'Administrator login',
  login_user:'User',login_pass:'Password',login_submit:'LOG IN',login_cancel:'Cancel',
  login_failed:'Wrong user or password',login_ok:'Signed in',
@@ -373,6 +399,17 @@ zh:{
  ota_lastcheck:'上次检查',ota_never:'从未',ota_failed:'检查更新失败',
  ota_ago_min:'{n} 分钟前',ota_ago_hour:'{n} 小时前',ota_ago_day:'{n} 天前',
  ota_install_confirm:'确定安装新固件并重启？所有客户端都会断开。',
+ sec_dev:'开发者模式',
+ dev_intro:'允许脚本在请求头里附带令牌，无需登录即可刷写固件。',
+ dev_enable:'允许用令牌（而非登录）更新固件',
+ dev_warn:'令牌可以直接替换固件，这是本设备权限最高的操作。它和面板密码一样是明文传输的，能监听网络的人就能读到。除非你要做自动化更新，否则保持关闭。',
+ dev_token_label:'令牌',dev_token_hint:'保存在设备上。若泄漏请生成新的。',
+ dev_regen_btn:'生成新令牌',
+ dev_cmd_label:'示例',
+ dev_off:'开发者模式已关闭。启用后会生成令牌。',
+ dev_on:'开发者模式已开启。持有令牌的人都能刷写本设备。',
+ dev_token_changed:'已生成新令牌。请更新所有使用旧令牌的地方。',
+ dev_need_on:'请先启用开发者模式。',
  login_btn:'登录',logout_btn:'退出登录',login_title:'管理员登录',
  login_user:'用户名',login_pass:'密码',login_submit:'登 录',login_cancel:'取消',
  login_failed:'用户名或密码错误',login_ok:'已登录',
@@ -467,7 +504,8 @@ function runSequential(fns,gen){
 }
 function loadSettings(gen){
   return runSequential([loadSsid,loadAuth,loadDoh,loadRadio,loadApCfg,loadAcl,loadDevPolicy,
-                        loadLeases,loadDnsRules,loadPortmaps,loadHostname,loadFwInfo],gen);
+                        loadLeases,loadDnsRules,loadPortmaps,loadHostname,loadFwInfo,
+                        loadDevMode],gen);
 }
 function init(){
   fetch('/status').then(function(r){return r.json()}).then(function(d){
@@ -1219,6 +1257,56 @@ function loadFwInfo(){
   /* Kept as the name the settings chain calls; the data now comes from
      /api/update so a page load makes one request, not two. */
   return loadUpdateInfo();
+}
+function devCmdText(token){
+  /* The header has to be spelled out: the token is not a cookie, so a plain
+     browser URL will not work and the example is the documentation. */
+  var u=location.protocol+'//'+location.host+'/ota';
+  return 'curl -X POST --data-binary @embedwrt.bin -H "Content-Type: application/octet-stream"'
+    +' -H "X-OTA-Token: '+(token||'<token>')+'" '+u;
+}
+function renderDevMode(d){
+  /* Note: never name a local 't' here. t() is the translation helper, and
+     shadowing it turns every later lookup into a call on a DOM element -
+     which fails at runtime, not at generation time. */
+  var on=document.getElementById('dev-on');
+  if(on){on.checked=!!d.enabled}
+  var tok=document.getElementById('dev-token');
+  if(tok){tok.value=d.token||''}
+  var c=document.getElementById('dev-cmd');
+  if(c){c.value=devCmdText(d.token)}
+  var m=document.getElementById('dev-msg');
+  if(m&&!m.innerHTML){m.innerHTML=d.enabled?t('dev_on'):t('dev_off')}
+  var r=document.getElementById('dev-regen');
+  if(r){r.disabled=!d.enabled}
+}
+function loadDevMode(){
+  return fetch('/api/devmode').then(function(r){return r.json()}).then(function(d){
+    renderDevMode(d);
+  }).catch(function(){});
+}
+function saveDevMode(){
+  var m=document.getElementById('dev-msg');
+  var on=document.getElementById('dev-on').checked?'1':'0';
+  fetch('/setdevmode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'on='+on})
+  .then(function(r){return r.text().then(function(x){
+    if(!r.ok){m.innerHTML='<span style="color:#b91c1c">'+t('rejected')+': '+x+'</span>';return}
+    m.innerHTML='<span style="color:#15803d">'+t('saved')+'</span>';
+    loadDevMode();
+  })}).catch(function(){m.innerHTML=t('failed')});
+}
+function regenDevToken(){
+  var m=document.getElementById('dev-msg');
+  if(!document.getElementById('dev-on').checked){m.innerHTML='<span style="color:#b45309">'+t('dev_need_on')+'</span>';return}
+  if(!confirm(t('dev_regen_btn')+'?')){return}
+  fetch('/setdevmode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'regen=1'})
+  .then(function(r){return r.text().then(function(x){
+    if(!r.ok){m.innerHTML='<span style="color:#b91c1c">'+t('rejected')+': '+x+'</span>';return}
+    m.innerHTML='<span style="color:#15803d">'+t('dev_token_changed')+'</span>';
+    loadDevMode();
+  })}).catch(function(){m.innerHTML=t('failed')});
 }
 /* Waits out the restart, then reports. The delay before the first poll matters:
    the response to the upload arrives while the OLD firmware is still running and
