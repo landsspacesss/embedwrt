@@ -368,6 +368,14 @@ static int version_cmp(const char *a, const char *b)
  */
 #define FW_URL_MAX 2048
 
+/*
+ * Task stack. Must fit a TLS handshake (~10 KB, see the note at the create
+ * call) plus the two FW_URL_MAX buffers this path keeps on the stack, with
+ * room to spare so a future addition does not silently reintroduce the
+ * overflow that a too-tight value caused.
+ */
+#define FW_TASK_STACK 16384
+
 typedef struct {
     bool     have_location;
     char     location[FW_URL_MAX];
@@ -1032,10 +1040,20 @@ void fw_update_init(void)
                  (int)ps);
     }
 
-    /* Priority below the reconnect task: a firmware check must never delay
-     * bringing the link back up. Stack for the HTTP client plus cJSON; no TLS
-     * here, so well under the DoH relay's. */
-    if (xTaskCreate(fw_update_task, "fw_update", 8192, NULL, 4, NULL) != pdPASS) {
+    /*
+     * Priority below the reconnect task: a firmware check must never delay
+     * bringing the link back up.
+     *
+     * The stack has to cover a TLS handshake, which on this chip is around
+     * 10 KB of software big-integer arithmetic - the DoH relay uses 10240 for
+     * exactly that reason. This task was originally 8192 because the update
+     * feed was plain HTTP on the LAN and no handshake ever happened; moving to
+     * an HTTPS feed without revisiting it overflowed the stack, and the device
+     * rebooted partway through every check. On top of the handshake this path
+     * also holds the redirect buffers (see FW_URL_MAX), so the total is
+     * deliberately well past the DoH figure rather than merely equal to it.
+     */
+    if (xTaskCreate(fw_update_task, "fw_update", FW_TASK_STACK, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "cannot create the update task");
     } else {
         ESP_LOGI(TAG, "auto-update from %s", s_url);
