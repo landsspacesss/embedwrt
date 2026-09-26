@@ -4,6 +4,13 @@ CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 
 # --- Board: ESP32-S3 N16R8 (16 MB flash) ---
+#
+# The target is pinned here, not left to `idf.py set-target`, because otherwise
+# a fresh checkout has no target and IDF silently defaults to esp32: the build
+# succeeds and produces an image for the wrong chip. That is invisible on a
+# machine that ran set-target once (the choice is cached in sdkconfig, which is
+# gitignored) and only shows up in CI or on someone else's clone.
+CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 # --- 4 MB app partition (see partitions.csv) ---
