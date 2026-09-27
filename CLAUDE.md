@@ -132,6 +132,15 @@ asking). Endpoints: `/api/update` (state), `/ota/check`, `/ota/install`,
 
 Design points that are deliberate:
 
+- **A build only updates from its own repository.** The firmware records which
+  repository it came from, and a feed belonging to a different one is refused
+  (`feed is 'x/y', this firmware is not`). Without this, a fork or a local edit
+  would be silently replaced by upstream's release, since the default feed points
+  upstream - not an update, just someone else's firmware.
+- **A build with uncommitted changes does not auto-install**, whatever the stored
+  setting says. The stored value is left alone rather than overwritten, so
+  rebuilding from a clean tree restores the user's choice instead of forgetting
+  it. Manual upload and the developer token still work: those are deliberate acts.
 - **Version comparison is strict.** Only a greater version counts, so the running
   build is never an update of itself and auto-install cannot loop.
 - **Auto-install defaults off.** A restart drops every client, so the device
@@ -146,6 +155,36 @@ Design points that are deliberate:
   the merged full-flash image, and writing that into an app slot cannot work.
 - **A release without `embedwrt.bin.sha256` is refused**, not installed
   unverified, so the checksum asset is not optional on the publishing side.
+
+**Build provenance comes from a generated header, written by a build step.**
+`tools/gen_build_info.cmake` runs on every build and writes
+`build/generated/fw_build_info.h` with `FW_BUILD_REPO` and `FW_BUILD_DIRTY`. Two
+things about that are load-bearing, and both were found by getting them wrong:
+
+- **Not at CMake configure time.** The dirty flag changes when a source file is
+  edited, and that makes CMake re-configure *not at all*, so a configure-time
+  value goes stale on the ordinary edit-then-rebuild path - precisely the case
+  the guard exists for.
+- **A header, not `add_compile_definitions()`.** Definitions set at the top level
+  do not reach an ESP-IDF component, and the failure is silent: the macro stays
+  undefined, the guard never fires, and the feature looks present. Threading them
+  through the cache to `main/CMakeLists.txt` works but is easy to get wrong;
+  a generated header with `target_include_directories` does not have the failure
+  mode. Verify by finding the origin string in `build/embedwrt.bin`, not by
+  reading the build log.
+
+The generated file is rewritten only when its content changes, so an unchanged
+answer does not force a rebuild.
+
+**Both sides are reduced to `owner/repo` before comparison**, because a feed is
+an API path (`.../repos/owner/repo/releases/latest`, GitHub or Gitea) and a build
+origin is a clone URL (`https://host/owner/repo.git` or `git@host:owner/repo`).
+Comparing those directly never matches, and the guard then looks broken rather
+than strict. `repo_identity()` handles both, and takes the **last** two path
+segments when there is no `repos` marker - taking the first two yields
+`host/owner` and matches nothing. That mistake was in the first version and was
+caught by compiling the function on the host and running the real URLs through
+it, which is worth doing again if it is ever touched.
 
 **GitHub, not a server on the LAN.** The feed used to be a self-hosted Gitea and
 was moved for a concrete reason: the device should not depend on a machine that
@@ -551,6 +590,17 @@ valid token; `/api/devmode` is unreadable anonymously. Rotating the token
 invalidates the old one immediately, disabling developer mode invalidates a
 valid one, and settings plus token survive a reboot. The panel section renders
 correctly in both languages.
+
+**Verified on hardware, build provenance:** a build from a modified tree reports
+`modified: true` and refuses to enable auto-install (400 with the reason, not a
+silent 200); a feed for a different repository is refused with
+`feed is 'someone/embedwrt', this firmware is not`; a feed for the build's own
+repository is accepted and proceeds to the check. A clean build reports
+`modified: false`, auto-install can be enabled, and the stored setting is
+restored rather than lost — the modified build had forced it off at runtime
+without overwriting NVS. The staleness fix was verified directly: with a clean
+tree the generator reports `dirty=0`, and editing one source file and rebuilding
+without reconfiguring reports `dirty=1`.
 
 **Not verified:** the guest path for *editing* — a guest changing its own lease or
 DNS, and releasing a device it holds — has been exercised over HTTP but not
