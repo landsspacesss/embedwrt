@@ -186,6 +186,39 @@ segments when there is no `repos` marker - taking the first two yields
 caught by compiling the function on the host and running the real URLs through
 it, which is worth doing again if it is ever touched.
 
+**The release CDN is unreachable from the device on this network, and that is
+not a firmware problem.** `release-assets.githubusercontent.com` — where every
+release asset actually lives, behind a 302 from both `api.github.com` and
+`browser_download_url` — cannot be reached *by this device*, while the same URL
+downloads fine from another machine on the same LAN over the same route. So the
+check succeeds and the install cannot: `/api/update` reports `cannot connect to
+release-assets.githubusercontent.com: ESP_FAIL`.
+
+Ruled out, with the experiment that ruled it out, so nobody repeats them:
+
+- **Certificate trust.** Building with `crt_bundle_attach` removed (verification
+  off) failed identically, which is what shows this is transport and not trust.
+- **Cross-signed chains.** The chain is cross-signed (leaf ← YR1 ← Root YR, and
+  Root YR is cross-signed by ISRG Root X1), and IDF's bundle genuinely cannot
+  verify that without `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY`.
+  That option is now on, and it did **not** fix this.
+- **DNS.** The resolver the device uses returns the same A records as one that
+  works, and the addresses are the ones the working machine connects to.
+- **Memory.** ~119 KB of internal heap free at the time of the failure.
+- **The Accept header.** A real bug, since GitHub's asset endpoint answers JSON
+  unless asked for `application/octet-stream` — but a separate one, fixed earlier.
+
+The comparison that misleads: testing from the development host *looks* like the
+same network, and is not. That host resolves through Tailscale MagicDNS, and
+more importantly it is a different device as far as the router is concerned. A
+router that filters per client or per destination will pass one and drop the
+other, which makes "works here, fails there" read as a firmware fault.
+
+What this means in practice: publishing works, the check works, and installing
+automatically does not work from behind this network. Manual upload from the
+panel and `POST /ota` with a developer token both still work, and are the paths
+to use here.
+
 **GitHub, not a server on the LAN.** The feed used to be a self-hosted Gitea and
 was moved for a concrete reason: the device should not depend on a machine that
 can be switched off. Two consequences of GitHub specifically:
@@ -601,6 +634,13 @@ restored rather than lost — the modified build had forced it off at runtime
 without overwriting NVS. The staleness fix was verified directly: with a clean
 tree the generator reports `dirty=0`, and editing one source file and rebuilding
 without reconfiguring reports `dirty=1`.
+
+**Verified on hardware, unattended install — blocked by the network, not the
+firmware:** the device reaches `api.github.com` and reports `up to date` against
+the live public feed, and it installs correctly when the image is pushed to it
+(panel upload, or `POST /ota` with a developer token). It cannot install itself
+from the feed on this network, because the asset CDN is unreachable from it —
+see the note above for the experiments that rule out the firmware.
 
 **Not verified:** the guest path for *editing* — a guest changing its own lease or
 DNS, and releasing a device it holds — has been exercised over HTTP but not

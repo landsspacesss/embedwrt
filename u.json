@@ -1,0 +1,1 @@
+{"state":"error","running":"1.4.5","latest":"","slot":"ota_1","url":"https://api.github.com/repos/landsspacesss/embedwrt/releases/latest","error":"cannot connect to api.github.com: ESP_ERR_HTTP_CONNECT","interval_hours":24,"auto_install":false,"modified":true,"build_repo":"landsspacesss/embedwrt","progress":0,"last_check_ago":0}
