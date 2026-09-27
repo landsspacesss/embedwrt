@@ -1,5 +1,7 @@
 # EmbedWRT
 
+**English** | [中文](README_zh.md)
+
 An ESP32-S3 WiFi repeater. It joins an upstream network as a station,
 re-broadcasts it on its own access point, and NATs between the two. Client DNS is
 answered locally and forwarded over DNS-over-HTTPS or DNS-over-TLS, so lookups do
