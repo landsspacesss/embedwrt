@@ -646,17 +646,33 @@ static esp_err_t fw_http_get_open(const char *url, const char *accept,
 
         esp_err_t oerr = esp_http_client_open(c, 0);
         if (oerr != ESP_OK) {
-            /* Name the host and the underlying error: this call can fail on any
-             * hop, and "cannot connect" alone sent me hunting through three
-             * layers of HTTP client to find out which one and why. */
+            /*
+             * Report enough to tell the failure modes apart, and capture it
+             * before cleanup because both come off the client handle.
+             *
+             * `tls_flags` is the decisive one: non-zero means the certificate
+             * chain or hostname was rejected (a trust problem), while zero with
+             * a socket errno means the connection never got that far (a
+             * transport problem). Without this the two look identical, and they
+             * need completely different fixes.
+             */
             char host[64];
             url_host(cur, host, sizeof(host));
+            int tls_code = 0, tls_flags = 0;
+            int sock_errno = esp_http_client_get_errno(c);
+            esp_http_client_get_and_clear_last_tls_error(c, &tls_code, &tls_flags);
+
+            const char *nm = esp_err_to_name(oerr);
+            char nmbuf[48];
+            snprintf(nmbuf, sizeof(nmbuf), "%.40s", nm ? nm : "?");
             esp_http_client_cleanup(c);
-            /* Explicit precisions on both: esp_err_to_name returns a string of
-             * unknown length, so without a bound the compiler cannot prove this
-             * fits and -Werror rejects it. */
-            snprintf(err, err_len, "cannot connect to %.48s: %.48s", host,
-                     esp_err_to_name(oerr));
+
+            /* Explicit precisions: esp_err_to_name's result has no known length,
+             * so without a bound the compiler cannot prove this fits and
+             * -Werror rejects it. */
+            snprintf(err, err_len,
+                     "cannot connect to %.40s: %.40s (errno %d, tls %d/%d)",
+                     host, nmbuf, sock_errno, tls_code, tls_flags);
             return ESP_FAIL;
         }
 
