@@ -3803,10 +3803,26 @@ static esp_err_t dnstest_get_handler(httpd_req_t *req)
     char def[DOH_URL_MAX];
     doh_relay_get_url(def, sizeof(def));
     char result[128];
-    doh_relay_probe(DNS_MODE_DOH, def, "example.com", result, sizeof(result));
+
+    /* Probe "example.com" by default, or a name of the caller's choosing.
+     * Being able to ask the device what it resolves is the difference between
+     * diagnosing a resolution problem and guessing at one - and the relay's own
+     * cache and circuit breakers are only visible through it. */
+    char name[128] = "example.com";
+    char q[192];
+    if (httpd_req_get_url_query_len(req) > 0 &&
+            httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char raw[128] = {0};
+        if (httpd_query_key_value(q, "name", raw, sizeof(raw)) == ESP_OK) {
+            url_decode(name, sizeof(name), raw);
+        }
+    }
+
+    doh_relay_probe(DNS_MODE_DOH, def, name, result, sizeof(result));
     cJSON *d = cJSON_CreateObject();
     cJSON_AddStringToObject(d, "addr", def);
     cJSON_AddStringToObject(d, "mode", "doh");
+    cJSON_AddStringToObject(d, "name", name);
     cJSON_AddStringToObject(d, "result", result);
     cJSON_AddItemToObject(root, "default", d);
 
@@ -3816,7 +3832,7 @@ static esp_err_t dnstest_get_handler(httpd_req_t *req)
     for (int i = 0; i < n; i++) {
         char mac[18];
         snprintf(mac, sizeof(mac), MACSTR, MAC2STR(list[i].mac));
-        doh_relay_probe(list[i].mode, list[i].addr, "example.com", result, sizeof(result));
+        doh_relay_probe(list[i].mode, list[i].addr, name, result, sizeof(result));
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "mac", mac);
         cJSON_AddStringToObject(o, "mode", mode_name(list[i].mode));
