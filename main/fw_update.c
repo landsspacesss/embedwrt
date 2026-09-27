@@ -75,11 +75,16 @@ static char s_dev_token[FW_DEV_TOKEN_LEN];
     "https://api.github.com/repos/landsspacesss/embedwrt/releases/latest"
 
 /*
- * Cap on the release metadata. Gitea returns the whole release including its
- * notes, and the fields we need are not all at the front: ``assets`` comes
- * before ``body`` but ``tag_name`` comes after it. Truncating would therefore
- * drop the version and make an available update look like "already up to date",
- * which is why exceeding this is an error rather than a silent trim.
+ * Cap on the release metadata. A release document includes its notes and one
+ * object per asset, and the field we need is not at the front: `tag_name` comes
+ * after `body` in GitHub's ordering. Truncating would therefore drop the version
+ * and make an available update look like "already up to date", which is why
+ * exceeding this is an error rather than a silent trim.
+ *
+ * Sized from measurements rather than a guess: a release with four assets and a
+ * short body is ~9.6 KB, and a repository with forty assets came to 55 KB. The
+ * limit cannot simply be raised to the worst case, because internal RAM has only
+ * about 72 KB free on this part.
  */
 #define FW_JSON_MAX (32 * 1024)
 
@@ -669,14 +674,23 @@ static esp_err_t fw_http_get_open(const char *url, const char *accept,
  * esp_http_client_perform() (used by the DoH relay) would work for the small
  * documents but not for the 1.2 MB image, so everything here uses the
  * open/fetch_headers/read form and one code path serves both.
+ *
+ * `accept` matters for anything fetched through GitHub's per-asset API endpoint
+ * (see asset_fetch_url): that endpoint answers with JSON metadata unless it is
+ * asked for application/octet-stream. Fetching the checksum without it returned
+ * 1645 bytes of JSON into a 256-byte buffer and failed as "response is 1645
+ * bytes, over the 255 byte limit" - which is the guard working, but on the
+ * wrong content. NULL for the release metadata, which is an ordinary JSON
+ * endpoint.
  */
-static esp_err_t http_get_to_buf(const char *url, char *buf, size_t cap,
+static esp_err_t http_get_to_buf(const char *url, const char *accept,
+                                 char *buf, size_t cap,
                                  size_t *out_len, int *status_out, char *err,
                                  size_t err_len)
 {
     esp_http_client_handle_t c = NULL;
     int64_t clen = 0;
-    if (fw_http_get_open(url, NULL, &c, &clen, status_out, err, err_len) != ESP_OK) {
+    if (fw_http_get_open(url, accept, &c, &clen, status_out, err, err_len) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -1034,8 +1048,9 @@ static esp_err_t do_check(void)
     char err[96] = {0};
     size_t n = 0;
     int status = 0;
-    esp_err_t err_code = http_get_to_buf(url, json, FW_JSON_MAX - 1, &n, &status,
-                                         err, sizeof(err));
+    /* The release metadata is plain JSON; no Accept override. */
+    esp_err_t err_code = http_get_to_buf(url, NULL, json, FW_JSON_MAX - 1, &n,
+                                         &status, err, sizeof(err));
     if (err_code != ESP_OK) {
         ESP_LOGW(TAG, "check failed: %s", err);
         free(json);
@@ -1156,7 +1171,11 @@ static esp_err_t do_install(void)
     char sbuf[256];
     size_t sn = 0;
     int status = 0;
-    if (http_get_to_buf(sha_url, sbuf, sizeof(sbuf) - 1, &sn, &status, err, sizeof(err)) != ESP_OK) {
+    /* A release asset, so it has to be asked for as bytes - see the note on
+     * http_get_to_buf. Without this the API endpoint returns its JSON metadata
+     * and the parse below fails on it. */
+    if (http_get_to_buf(sha_url, "application/octet-stream", sbuf, sizeof(sbuf) - 1,
+                        &sn, &status, err, sizeof(err)) != ESP_OK) {
         ESP_LOGW(TAG, "cannot fetch the checksum: %s", err);
         set_state(FW_ERROR, err);
         return ESP_FAIL;
