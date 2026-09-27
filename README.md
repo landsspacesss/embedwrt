@@ -155,7 +155,7 @@ admin-only at the route level on purpose: they would otherwise return 401 before
 the per-device check could decide, and a guest could never edit its own device.
 They are guarded by ownership instead, which fails closed.
 
-Useful for diagnostics: `/api/status`, `/api/version` (installed version and
+Useful for diagnostics: `/status`, `/api/version` (installed version and
 which slot it is running from), `/api/update` (auto-update state), and
 `/api/dnstest`, which runs a real query through every configured resolver using
 the same code path the relay serves clients with.

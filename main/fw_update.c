@@ -613,6 +613,21 @@ static esp_http_client_handle_t fw_http_open(const char *url, redirect_capture_t
  * it again because the redirect target is a different host. That is why the
  * default check interval is a day rather than an hour.
  */
+/* The host part of a URL, for diagnostics. "cannot connect" on its own does not
+ * say which of the several hosts involved refused, and a redirect makes that
+ * genuinely ambiguous. */
+static void url_host(const char *url, char *out, size_t out_len)
+{
+    const char *p = strstr(url, "://");
+    p = (p != NULL) ? p + 3 : url;
+    size_t i = 0;
+    while (p[i] && p[i] != '/' && p[i] != '?' && i < out_len - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
 static esp_err_t fw_http_get_open(const char *url, const char *accept,
                                   esp_http_client_handle_t *client_out,
                                   int64_t *len_out, int *status_out, char *err,
@@ -629,9 +644,16 @@ static esp_err_t fw_http_get_open(const char *url, const char *accept,
             return ESP_FAIL;
         }
 
-        if (esp_http_client_open(c, 0) != ESP_OK) {
+        esp_err_t oerr = esp_http_client_open(c, 0);
+        if (oerr != ESP_OK) {
+            /* Name the host and the underlying error: this call can fail on any
+             * hop, and "cannot connect" alone sent me hunting through three
+             * layers of HTTP client to find out which one and why. */
+            char host[128];
+            url_host(cur, host, sizeof(host));
             esp_http_client_cleanup(c);
-            snprintf(err, err_len, "cannot connect");
+            snprintf(err, err_len, "cannot connect to %s: %s", host,
+                     esp_err_to_name(oerr));
             return ESP_FAIL;
         }
 

@@ -35,7 +35,7 @@ The device is reachable three ways, which is convenient for testing: from the
 upstream LAN (whatever address DHCP handed it), `http://192.168.4.1/` from a
 client on its own AP, and `http://espwifi.local/` via mDNS. The upstream address
 *changes*; find it by the station MAC rather than assuming a fixed address. The
-MAC is printed at boot (`wifi:mode : sta (...)`) and reported by `/api/status`.
+MAC is printed at boot (`wifi:mode : sta (...)`) and reported by `/status`.
 
 `sdkconfig` is **gitignored**; `sdkconfig.defaults` is the source of truth. After
 editing it, delete `sdkconfig` and rebuild, otherwise the regenerated config keeps
