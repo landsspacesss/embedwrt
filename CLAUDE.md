@@ -41,6 +41,15 @@ MAC is printed at boot (`wifi:mode : sta (...)`) and reported by `/api/status`.
 editing it, delete `sdkconfig` and rebuild, otherwise the regenerated config keeps
 the old values.
 
+**The target is pinned in `sdkconfig.defaults`, and has to be.** `sdkconfig` is
+where `set-target` records the chip, and it is not checked in, so a fresh
+checkout has no target and IDF silently defaults to `esp32`: the build succeeds
+and produces an image for the wrong chip. A machine that ran `set-target` once
+never notices, because `sdkconfig` remembers — which is exactly why this survives
+until CI or a contributor hits it. `CONFIG_IDF_TARGET="esp32s3"` makes IDF guess
+correctly from `sdkconfig.defaults` instead. Found by building the tagged tree in
+an empty directory rather than trusting the local build.
+
 ### Updating over the network
 
 Once the OTA partition table is in place, `idf.py flash` is only needed for the
@@ -67,17 +76,32 @@ Two consequences worth knowing before you change the partition table:
 
 ### Releasing
 
+**Tag it, and GitHub Actions does the rest.** `v*` triggers
+`.github/workflows/release.yml`, which builds in the official ESP-IDF container
+and uploads the four assets. The binaries on the release page are therefore built
+by CI from exactly the tagged source, so they can be checked against it — and
+publishing no longer depends on a machine in this house, which is the whole point
+of hosting here.
+
 ```sh
-python3 tools/make_release.py --dry-run   # what would happen
-python3 tools/make_release.py             # tag, push, publish, upload
+# bump PROJECT_VER in CMakeLists.txt first, then:
+git tag -a v1.3.1 -m "EmbedWRT 1.3.1" && git push origin v1.3.1
 ```
 
-It reads the version from `PROJECT_VER` in `CMakeLists.txt` and refuses to
-publish if the image's embedded descriptor disagrees, so **bump `PROJECT_VER`
+A local release still works when CI is not the right tool (or to reproduce a
+failure): `python3 tools/make_release.py` builds, tags, pushes and uploads in one
+step, and `--dry-run` shows what it would do. Both paths share the asset list,
+the checksum naming and the verification, in `tools/make_release.py`; CI invokes
+it with `--from-tag`, which skips tagging and pushing because the tag is what
+started the run.
+
+`make_release.py` reads the version from `PROJECT_VER` and refuses to publish if
+the tag or the image's embedded descriptor disagrees, so **bump `PROJECT_VER`
 before releasing**. The reason is not tidiness: the device compares its own
 compiled-in version against the release tag, so a tag that disagrees with the
 image means the device reports the old version forever and considers itself
-always up to date.
+always up to date. It also verifies the assets came back named correctly rather
+than trusting the upload.
 
 Four assets go up: both images and a `.sha256` for each. **The checksum assets
 are required** — the updater refuses a release without `embedwrt.bin.sha256`,
@@ -85,13 +109,26 @@ because it will not flash an image it cannot verify. A release missing that
 asset is not an error anyone sees until an update is attempted, which is why the
 script uploads it every time rather than leaving it to memory.
 
+Two things the workflow needs that are easy to miss:
+
+- **`workflow` token scope.** Pushing a commit that touches
+  `.github/workflows/` is rejected without it, on both the git and the REST
+  path, with a message about the PAT. `gh auth refresh -s workflow` adds it.
+- **`dependencies.lock` is tracked.** It pins the managed components
+  (`espressif/mdns`, `cJSON`) so CI builds the same versions as a local build.
+  Untracked, the runner resolves `^1.0.2` afresh and can pull a version nobody
+  tested — a worse failure for a firmware release than a red build, because the
+  image would differ from the verified one.
+
 ### Automatic updates
 
 `fw_update.c` holds both the OTA primitives and a background task that asks a
-Gitea release feed whether something newer exists. Settings live in NVS under
-`ota_url` (the `releases/latest` endpoint), `otachk` (hours; 0 = off) and
-`otaauto` (install without asking). Endpoints, all admin-only: `/api/update`
-(state), `/ota/check`, `/ota/install`, `/setotacfg`.
+release feed whether something newer exists. The default feed is the GitHub
+`releases/latest` endpoint for `landsspacesss/embedwrt`; a self-hosted mirror can
+be pointed at from the panel, which is what `ota_url` is for. Settings live in
+NVS under `ota_url`, `otachk` (hours; 0 = off) and `otaauto` (install without
+asking). Endpoints: `/api/update` (state), `/ota/check`, `/ota/install`,
+`/setotacfg`.
 
 Design points that are deliberate:
 
@@ -105,6 +142,31 @@ Design points that are deliberate:
 - The task blocks until the station has an address; the router tells it via
   `fw_update_set_online()` rather than the updater reaching into the router's
   event group.
+- **Only the asset named exactly `embedwrt.bin` is used.** Releases also carry
+  the merged full-flash image, and writing that into an app slot cannot work.
+- **A release without `embedwrt.bin.sha256` is refused**, not installed
+  unverified, so the checksum asset is not optional on the publishing side.
+
+**GitHub, not a server on the LAN.** The feed used to be a self-hosted Gitea and
+was moved for a concrete reason: the device should not depend on a machine that
+can be switched off. Two consequences of GitHub specifically:
+
+- **The repo has to be public.** The device fetches anonymously, and GitHub
+  answers 404 (not 403) for a private repo to an unauthenticated caller, so a
+  private repo looks exactly like a missing one.
+- **`browser_download_url` is not always reachable.** It points at github.com,
+  which on some networks is blocked while `api.github.com` is not. The per-asset
+  API `url` stays on api.github.com, so `asset_fetch_url()` prefers it when the
+  host is api.github.com and only falls back to `browser_download_url` otherwise
+  (a Gitea mirror's `url` means something different).
+
+**Redirects are followed by hand, and have to be.** Automatic redirects only
+exist inside `esp_http_client_perform()`, which buffers the whole body and is
+therefore unusable for a 1.2 MB image; on the streaming path a 3xx arrives as-is
+and would look like a server error. GitHub hands back a signed object-storage URL
+per asset, so `fw_http_get_open()` loops on `Location`, captured via
+`HTTP_EVENT_ON_HEADER` because there is no API to read a response header. A
+signed URL measures 910-930 characters, hence `FW_URL_MAX` at 2048.
 
 **Hashing uses the PSA API, not `mbedtls_sha256_*`.** There is no
 `mbedtls/sha256.h` in IDF 6.1 — it moved into the tf-psa-crypto private tree
@@ -113,25 +175,55 @@ behind `MBEDTLS_ALLOW_PRIVATE_ACCESS`, so the familiar calls do not compile. Use
 (`psa/crypto.h`); the symbols are in libmbedcrypto already and go through the
 chip's SHA acceleration.
 
-**A reply with no `content-length` reads as length 0, not as empty.**
-Gitea answers release metadata with `Transfer-Encoding: chunked`, and
-`esp_http_client_fetch_headers()` returns 0 for that. Treating 0 as a real
-length made every check fail with "short read (5862 of 0 bytes)". With the
-length unknown the reply can also overflow the buffer, and truncating is the
-worse failure: `tag_name` sits *after* the release notes in that JSON, so a
-trimmed document parses cleanly and merely looks like no update is available.
-The reader now errors explicitly instead — `esp_http_client_is_complete_data_received()`
-is what distinguishes a complete reply from a full buffer.
+**A reply with no `content-length` reads as length 0, not as empty.** A chunked
+reply (which is what both Gitea and GitHub send) makes
+`esp_http_client_fetch_headers()` return 0. Treating 0 as a real length made
+every check fail with "short read (5862 of 0 bytes)". With the length unknown the
+reply can also overflow the buffer, and truncating is the worse failure:
+`tag_name` sits *after* the release notes in that JSON, so a trimmed document
+parses cleanly and merely looks like no update is available. The reader errors
+explicitly instead — `esp_http_client_is_complete_data_received()` is what
+distinguishes a complete reply from a full buffer.
+
+**The check buffer is 32 KB and the release JSON is ~9.6 KB.** Measured, not
+guessed: a release with a long body and many assets can be far larger (a
+40-asset release was 55 KB and tripped the limit), but that is what the explicit
+error is for. It has to stay an error rather than a trim, and it cannot be sized
+to the worst case because internal RAM is only ~72 KB free.
 
 **Security boundary.** The image is verified against a sha256 fetched over the
-same plain-HTTP LAN connection, which catches truncation, flash corruption and
-the wrong file — but **not** an attacker who can rewrite both the image and its
-checksum. Resisting that needs a signature with the public key compiled in
-(Ed25519; verification is milliseconds, unlike the ~2 s TLS handshake this chip
-cannot afford). That is not implemented. In other words the device fetches and
-executes code over an unauthenticated channel by design, so treat the Gitea host
-as trusted. `ota_url` is settable from the panel, but only `http://` URLs are
-accepted and only an admin can set it.
+same HTTPS connection, which catches truncation, flash corruption and the wrong
+file — but **not** an attacker who can rewrite both the image and its checksum.
+Resisting that needs a signature with the public key compiled in (Ed25519;
+verification is milliseconds, unlike the ~2 s TLS handshake this chip cannot
+afford). That is not implemented, so a compromised release feed means compromised
+firmware. `ota_url` is settable from the panel, but only `http://` or `https://`
+URLs are accepted and only an admin can set it.
+
+### Developer mode: flashing with a token
+
+`/ota`, `/ota/check` and `/ota/install` accept an `X-OTA-Token` header in place
+of an admin session, so a script can install firmware without a browser. The
+field is `token_ok` on `route_t` and nothing else sets it.
+
+Deliberate limits, because a token that can replace firmware is the most powerful
+credential on the device:
+
+- **Off until switched on** (`/setdevmode`), and the token is generated on first
+  enable rather than left empty.
+- **Scope is three routes.** A leaked token cannot read the client list or change
+  WiFi settings; every other admin-only route still 401s with a valid token.
+- **`/api/devmode` is not itself token-authorized**, so a token cannot be read
+  back or rotated with the token alone.
+- **Compared without an early exit**, so a wrong guess leaks nothing through
+  timing.
+- **Header, not query string**: URLs end up in logs and referrers.
+- Over HTTP in the clear, like the panel password. Anyone who can watch the LAN
+  can read it, which is what the panel warning says.
+
+Note that `route_t` gained a field, and `-Wextra` plus `-Werror` forced every
+existing route to spell it out. That churn is the existing design working: a new
+endpoint (or field) cannot be added without a decision about who may reach it.
 
 ### Partitions, and why there is no factory slot
 
@@ -279,9 +371,9 @@ why it cannot lock anyone out.
 
 One NVS namespace, `"storage"`. Strings: `ssid`, `password` (upstream),
 `ap_ssid`, `ap_pass`, `ap_hidden`, `ap_maxconn`, `ap_txpower`, `doh_url`,
-`mdns_host`, `web_user`, `web_pass`, `ota_url`. Blobs: `leases`, `dnsrules`,
-`pforwards`, `acl`, `devices`. Single bytes: `guestclaim`, `iotclrvis`,
-`otaauto`. Numbers: `otachk` (u32, hours).
+`mdns_host`, `web_user`, `web_pass`, `ota_url`, `devtoken`. Blobs: `leases`,
+`dnsrules`, `pforwards`, `acl`, `devices`. Single bytes: `guestclaim`,
+`iotclrvis`, `otaauto`, `devmode`. Numbers: `otachk` (u32, hours).
 
 The hot-path tables (`static_leases`, `dns_rules`, `ap_acl`, `devices`) are
 **double buffered**: readers follow an index and never take a lock, writers build
@@ -296,6 +388,27 @@ write when nothing changes**, since `devices_clear_iot()` is called on *every*
 request and committing each time would wear the flash for no reason.
 
 ## Gotchas that cost real time
+
+**A task that gains a TLS handshake needs a bigger stack than the one it had.**
+The update task was created with 8192 because its feed was plain HTTP on the LAN,
+and the comment beside it said exactly that. Pointing it at an HTTPS feed made
+the comment false and nothing revisited the number, so every check overflowed:
+the device rebooted a few seconds in, came back with its RAM sessions cleared,
+and reported nothing at all. The DoH relay needs 10240 for the same handshake and
+says so in its own comment; this path also keeps the redirect buffers on its
+stack, so it is sized well past that (see `FW_TASK_STACK`).
+
+The clue that places the fault is that it did **not** roll back. A crash in
+`app_main` before `esp_ota_mark_app_valid_cancel_rollback()` triggers the
+bootloader's revert; a crash in a task afterwards does not, so the device looks
+like it merely hiccupped. When a device reboots for no apparent reason, check
+whether a task is doing something its stack was not sized for.
+
+**A local variable named `t` shadows the translation helper.** The panel's
+translation function is `t()`, and a section that stored a DOM element in a local
+`t` made every label in it throw at runtime. It generated cleanly and passed
+`node --check`, because both only look at syntax. Fixing it needs the panel
+actually opened; the generator's key check cannot see this class of bug.
 
 **`idf.py monitor` resets the chip.** Right after a reset, associated clients
 show an empty IP until their DHCP completes — which looks exactly like DHCP being
@@ -348,6 +461,13 @@ reach it. Most routes are admin-only; the guest-reachable ones are exactly `/`,
 deliberately *not* admin-only at the route level: they would otherwise return 401
 before the per-device guard could decide, and a guest could never edit its own
 device. They rely on `caller_may_touch()` instead, which fails closed.
+
+`route_t` also carries `token_ok`, which lets the developer token stand in for a
+session on that route. Exactly three routes set it (`/ota`, `/ota/check`,
+`/ota/install`) and the compiler enforces the decision: `-Wextra` flags a missing
+field initializer and this project builds with `-Werror`, so a new route has to
+state its answer rather than inherit one. The route table is 49 entries against
+`max_uri_handlers` of 60.
 
 **Answering a request whose body is still unread desynchronises the connection.**
 The client sees the status line but not the body, so a rejection arrives as a
@@ -417,15 +537,30 @@ two minutes after boot. A deliberately wrong `embedwrt.bin.sha256` was refused a
 "checksum mismatch" with the device left running the old firmware and its config
 untouched; a release missing the checksum asset, and one missing the app image
 while still carrying the merged full-flash image, were both refused with a clear
-reason. Settings survived the reboots that followed, and all four new endpoints
-return 401 to a guest.
+reason. Settings survived the reboots that followed, and the new endpoints return
+401 to a guest.
+
+**Verified on hardware, HTTPS feed and developer mode:** the device performs an
+HTTPS check against `api.github.com` and reports a clean result — the run that
+proved this also proved the stack fix, by staying reachable and keeping its
+session for the whole check instead of rebooting. A real image was installed
+three times using only `X-OTA-Token`, with the slot alternating each time. The
+auth matrix was exercised: absent, wrong and wrong-length tokens all 401; the
+correct token reaches the handler; six admin-only non-OTA routes still 401 with a
+valid token; `/api/devmode` is unreadable anonymously. Rotating the token
+invalidates the old one immediately, disabling developer mode invalidates a
+valid one, and settings plus token survive a reboot. The panel section renders
+correctly in both languages.
 
 **Not verified:** the guest path for *editing* — a guest changing its own lease or
 DNS, and releasing a device it holds — has been exercised over HTTP but not
 through a browser on the AP since the guest view was reworked into collapsible
 cards. Rollback has been proven on the manual upload path, not separately on the
 automatic one; both call the same `fw_ota_finish`, so the mechanism is shared,
-but the auto path has not itself been handed a bad image.
+but the auto path has not itself been handed a bad image. The device completing
+an end-to-end *automatic* install from the GitHub feed has not been observed
+either — the feed was pointed at GitHub only after the repo existed, and a
+private repo answers 404 to the device's anonymous request.
 
 **Known limits of the update path:** a panel session lives in RAM, so an OTA
 restart logs the administrator out; that is expected and the UI says so. The
