@@ -15,3 +15,13 @@ idf_component_register(SRCS ${srcs}
                                   esp_http_client esp_http_server esp-tls mbedtls lwip
                                   esp_driver_rmt espressif__mdns app_update
                     EMBED_TXTFILES "certs/gsr5.pem")
+
+# Build provenance, computed by the top-level CMakeLists.txt. It has to be
+# attached to this component explicitly: add_compile_definitions() at the top
+# level does not reach ESP-IDF components, and the failure is silent - the
+# macros stay undefined, the guard never fires, and the feature looks present.
+#
+# fw_update.c uses these to refuse a feed that is not this build's own repository.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    FW_BUILD_REPO="${EMBEDWRT_ORIGIN}"
+    FW_BUILD_DIRTY=${EMBEDWRT_DIRTY})

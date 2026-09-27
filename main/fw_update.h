@@ -89,6 +89,14 @@ const char *fw_ota_result_text(fw_ota_result_t r);
 
 /* ======================= automatic updates ======================= */
 
+/*
+ * One size for every error string this module produces or stores. They used to
+ * differ, which is how a longer message turned into a -Werror build failure
+ * about possible truncation the moment the message grew - and would otherwise
+ * have become a silently clipped message in the panel.
+ */
+#define FW_ERR_MAX 192
+
 typedef enum {
     FW_IDLE = 0,
     FW_CHECKING,       /* asking the server */
@@ -109,8 +117,14 @@ typedef struct {
     char slot[24];         /* partition this build is running from */
     uint32_t interval_hours;   /* 0 = periodic checks are off */
     bool auto_install;
+    /* This build has uncommitted source changes. Auto-install is forced off:
+       the whole point of an edit is that it should not be silently replaced.
+       The panel shows why, and offers to re-enable once the tree is clean. */
+    bool modified;
+    /* The repository this firmware came from, "owner/repo" ("" if unknown). */
+    char build_repo[64];
     char url[256];
-    char error[96];
+    char error[FW_ERR_MAX];
     int progress;          /* 0..100 while downloading, else 0 */
     int64_t last_check_us; /* 0 = never checked */
 } fw_status_t;

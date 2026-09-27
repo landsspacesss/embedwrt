@@ -204,6 +204,8 @@ input:focus,select:focus{border-color:#3b82f6}
       </select></div>
     <div class='form-group'><label><input type='checkbox' id='ota-auto' style='width:auto;margin-right:6px'><span data-i18n='ota_auto'></span></label>
       <div class='hint' style='margin:6px 0 0' data-i18n='ota_auto_hint'></div></div>
+    <div id='ota-modified' class='hint' style='display:none;margin:0 0 10px;color:#b45309' data-i18n='ota_modified'></div>
+    <div class='form-group'><label data-i18n='ota_buildrepo_label'></label><input type='text' id='ota-buildrepo' class='mono' readonly></div>
     <div class='form-group'><label data-i18n='ota_url_label'></label><input type='text' id='ota-url' placeholder='http://host/api/v1/repos/owner/repo/releases/latest'></div>
     <button class='btn' onclick='saveOtaCfg()' data-i18n='ota_save_btn'>SAVE SETTINGS</button>
 
@@ -308,6 +310,8 @@ en:{
  ota_auto:'Install new versions without asking',
  ota_auto_hint:'Off by default: a restart drops every client, so the device waits for you. With this on it installs as soon as it finds a newer release.',
  ota_url_label:'Release feed URL',ota_save_btn:'SAVE SETTINGS',
+ ota_modified:'This firmware was built from a modified source tree, so it will not install updates automatically. Rebuild from a clean checkout to enable that, or set the feed to your own repository.',
+ ota_buildrepo_label:'Built from',ota_repo_unknown:'(unknown source)',
  ota_check_btn:'CHECK FOR UPDATES',ota_checking:'Checking',ota_uptodate:'Up to date',
  ota_available:'Version {v} is available.',ota_install_btn:'INSTALL AND RESTART',
  ota_downloading:'Downloading',ota_installing:'Written and verified; restarting',
@@ -393,6 +397,8 @@ zh:{
  ota_auto:'发现新版本直接安装，不询问',
  ota_auto_hint:'默认关闭：重启会踢掉所有客户端，所以由你决定时机。开启后会一发现新版本就自动安装。',
  ota_url_label:'发布源地址',ota_save_btn:'保存设置',
+ ota_modified:'本固件由已修改的源码构建，因此不会自动安装更新。若需要自动更新，请从干净的检出重新构建，或把发布源改到你自己的仓库。',
+ ota_buildrepo_label:'构建来源',ota_repo_unknown:'（来源未知）',
  ota_check_btn:'检查更新',ota_checking:'检查中',ota_uptodate:'已是最新',
  ota_available:'发现新版本 {v}。',ota_install_btn:'安装并重启',
  ota_downloading:'下载中',ota_installing:'已写入并校验通过，正在重启',
@@ -1180,7 +1186,16 @@ function loadUpdateInfo(){
     var h=document.getElementById('ota-hours');
     if(h){h.value=String(d.interval_hours)}
     var a=document.getElementById('ota-auto');
-    if(a){a.checked=!!d.auto_install}
+    if(a){
+      a.checked=!!d.auto_install;
+      /* A build with local modifications refuses to auto-install, so the
+         checkbox is disabled and the reason shown instead of springing back. */
+      a.disabled=!!d.modified;
+    }
+    var note=document.getElementById('ota-modified');
+    if(note){note.style.display=d.modified?'block':'none'}
+    var br=document.getElementById('ota-buildrepo');
+    if(br){br.value=d.build_repo||t('ota_repo_unknown')}
     var u=document.getElementById('ota-url');
     /* Never overwrite what the user is in the middle of typing. */
     if(u&&document.activeElement!==u){u.value=d.url||''}

@@ -24,6 +24,18 @@
 
 #define TAG "fw_update"
 
+/*
+ * What this firmware was built from, supplied by CMakeLists.txt. Empty when
+ * there was no git to ask (a source tarball), which makes the build
+ * unattributed - see the guard in do_check().
+ */
+#ifndef FW_BUILD_REPO
+#define FW_BUILD_REPO ""
+#endif
+#ifndef FW_BUILD_DIRTY
+#define FW_BUILD_DIRTY 0
+#endif
+
 #define NVS_NAMESPACE "storage"
 #define NVS_KEY_INTERVAL "otachk"    /* u32 hours; 0 = periodic checks off */
 #define NVS_KEY_AUTO     "otaauto"   /* u8: install without asking */
@@ -80,7 +92,7 @@ static char     s_url[256] = DEFAULT_URL;
 /* Runtime state, all guarded by s_lock. */
 static fw_state_t s_state = FW_IDLE;
 static char       s_latest[32];
-static char       s_error[96];
+static char       s_error[FW_ERR_MAX];
 static int        s_progress;
 static int64_t    s_last_check_us;
 
@@ -224,6 +236,17 @@ static void load_settings(void)
     }
     nvs_close(h);
 
+    /*
+     * A build with uncommitted changes does not auto-install, whatever the
+     * stored setting says. The stored value is left alone rather than
+     * overwritten, so rebuilding from a clean tree restores the user's choice
+     * instead of silently forgetting it.
+     */
+    if (FW_BUILD_DIRTY && s_auto_install) {
+        s_auto_install = false;
+        ESP_LOGW(TAG, "this build has local modifications, so auto-install is off");
+    }
+
     ESP_LOGI(TAG, "check every %u h, auto-install %s, developer mode %s",
              (unsigned)s_interval_hours, s_auto_install ? "on" : "off",
              s_dev_mode ? "ENABLED" : "off");
@@ -254,6 +277,12 @@ esp_err_t fw_update_set_interval(uint32_t hours)
 
 esp_err_t fw_update_set_auto(bool on)
 {
+    /* Refused rather than quietly ignored: a switch that springs back with no
+     * explanation is worse than one that says why. The panel reports this. */
+    if (on && FW_BUILD_DIRTY) {
+        ESP_LOGW(TAG, "cannot enable auto-install: this build has local modifications");
+        return ESP_ERR_INVALID_STATE;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_auto_install = on;
     xSemaphoreGive(s_lock);
@@ -806,6 +835,125 @@ done:
 /* ======================= check ======================= */
 
 /*
+ * Reduce a repository reference to "owner/repo", lowercase.
+ *
+ * Both sides of the comparison need the same shape: a feed URL is an API path
+ * (`.../repos/owner/repo/releases/latest`, on GitHub or Gitea) while the build
+ * origin is a clone URL (`https://host/owner/repo.git` or
+ * `git@host:owner/repo`). Comparing those two strings directly would never
+ * match, and the mismatch would look like a bug in the guard rather than the
+ * point of it.
+ *
+ * Returns false when nothing identifiable is present.
+ */
+static bool repo_identity(const char *url, char *out, size_t out_len)
+{
+    if (url == NULL || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    /* Skip any scheme, and turn git@host:owner/repo into host/owner/repo. */
+    const char *p = url;
+    const char *colon = NULL;
+    for (const char *q = url; *q; q++) {
+        if (*q == '/' || *q == ':') {
+            colon = q;
+            break;
+        }
+    }
+    const char *scheme_end = strstr(url, "://");
+    if (scheme_end != NULL) {
+        p = scheme_end + 3;
+    } else if (colon != NULL && colon > url && colon[-1] != '/') {
+        p = url;   /* scp-like: git@host:owner/repo */
+    }
+
+    /* Copy the path, dropping query and fragment, so it can be split. */
+    char path[FW_URL_MAX];
+    snprintf(path, sizeof(path), "%s", p);
+    for (char *c = path; *c; c++) {
+        if (*c == '?' || *c == '#') {
+            *c = '\0';
+            break;
+        }
+    }
+
+    /* Collect up to 8 path segments after turning ':' separators into '/'. */
+    char *seg[8];
+    int nseg = 0;
+    for (char *c = path; *c && nseg < 8; ) {
+        while (*c == '/' || *c == ':') {
+            *c++ = '\0';
+        }
+        if (*c == '\0') {
+            break;
+        }
+        seg[nseg++] = c;
+        while (*c && *c != '/' && *c != ':') {
+            c++;
+        }
+    }
+    if (nseg < 2) {
+        return false;
+    }
+
+    /* Drop a ".git" suffix and any trailing "releases/..." or "tags/...". */
+    size_t last = strlen(seg[nseg - 1]);
+    if (last > 4 && strcasecmp(seg[nseg - 1] + last - 4, ".git") == 0) {
+        seg[nseg - 1][last - 4] = '\0';
+    }
+    for (int i = 0; i < nseg; i++) {
+        if (strcasecmp(seg[i], "releases") == 0 || strcasecmp(seg[i], "tags") == 0) {
+            nseg = i;
+            break;
+        }
+    }
+    /*
+     * An API path has a "repos" segment and the owner/repo follow it; a clone
+     * URL has neither, and owner/repo are the LAST two segments. Defaulting to
+     * the last two and only overriding on "repos" is what makes
+     * https://host/owner/repo.git comparable with
+     * https://api.host/repos/owner/repo/releases/latest - taking the first two
+     * instead would yield "host/owner", which never matches anything.
+     */
+    int from = nseg - 2;
+    for (int i = 0; i < nseg; i++) {
+        if (strcasecmp(seg[i], "repos") == 0 && nseg - (i + 1) >= 2) {
+            from = i + 1;
+            break;
+        }
+    }
+
+    snprintf(out, out_len, "%s/%s", seg[from], seg[from + 1]);
+    for (char *c = out; *c; c++) {
+        *c = (char)tolower((unsigned char)*c);
+    }
+    return true;
+}
+
+/*
+ * May this firmware install what the configured feed serves?
+ *
+ * The feed and the build must belong to the same repository. A fork carries its
+ * own origin, so the default feed - upstream - stops being an update and
+ * becomes someone else's firmware, which is exactly the mistake worth refusing.
+ * A user who really wants to track upstream can change the feed to match, which
+ * is a deliberate act rather than a default.
+ */
+static bool feed_matches_build(const char *feed_url, char *feed_id, size_t feed_len)
+{
+    char build_id[128];
+    bool have_feed = repo_identity(feed_url, feed_id, feed_len);
+    bool have_build = repo_identity(FW_BUILD_REPO, build_id, sizeof(build_id));
+
+    if (!have_feed || !have_build) {
+        return false;
+    }
+    return strcmp(feed_id, build_id) == 0;
+}
+
+/*
  * Where to fetch one release asset from.
  *
  * GitHub offers two addresses per asset and they are not equivalent on this
@@ -841,6 +989,32 @@ static esp_err_t do_check(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     snprintf(url, sizeof(url), "%s", s_url);
     xSemaphoreGive(s_lock);
+
+    /*
+     * Refuse a feed that is not this build's own repository. Doing it here
+     * rather than at install time means the panel explains it on the check
+     * - the user sees why nothing is happening instead of finding that the
+     * install button quietly does nothing.
+     */
+    {
+        char feed_id[128];
+        if (!feed_matches_build(url, feed_id, sizeof(feed_id))) {
+            /* Sized for the identity embedded above, not for a typical one:
+             * snprintf is checked against the declared size, and -Werror turns
+             * a possible truncation into a build failure. */
+            char msg[FW_ERR_MAX];
+            if (FW_BUILD_REPO[0] == '\0') {
+                snprintf(msg, sizeof(msg), "built without a repository; "
+                                           "set the feed for your own");
+            } else {
+                snprintf(msg, sizeof(msg), "feed is '%s', this firmware is not",
+                         feed_id[0] ? feed_id : "unrecognised");
+            }
+            ESP_LOGW(TAG, "refusing feed: %s", msg);
+            set_state(FW_ERROR, msg);
+            return ESP_FAIL;
+        }
+    }
 
     char *json = malloc(FW_JSON_MAX);
     if (json == NULL) {
@@ -1083,6 +1257,11 @@ void fw_update_status(fw_status_t *out)
     snprintf(out->running, sizeof(out->running), "%s", d ? d->version : "");
     const esp_partition_t *run = esp_ota_get_running_partition();
     snprintf(out->slot, sizeof(out->slot), "%s", run ? run->label : "");
+
+    out->modified = FW_BUILD_DIRTY;
+    if (!repo_identity(FW_BUILD_REPO, out->build_repo, sizeof(out->build_repo))) {
+        out->build_repo[0] = '\0';
+    }
 }
 
 static void fw_update_task(void *arg)

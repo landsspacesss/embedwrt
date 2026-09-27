@@ -975,6 +975,8 @@ static const char *html_page =
 "      </select></div>"
 "    <div class='form-group'><label><input type='checkbox' id='ota-auto' style='width:auto;margin-right:6px'><span data-i18n='ota_auto'></span></label>"
 "      <div class='hint' style='margin:6px 0 0' data-i18n='ota_auto_hint'></div></div>"
+"    <div id='ota-modified' class='hint' style='display:none;margin:0 0 10px;color:#b45309' data-i18n='ota_modified'></div>"
+"    <div class='form-group'><label data-i18n='ota_buildrepo_label'></label><input type='text' id='ota-buildrepo' class='mono' readonly></div>"
 "    <div class='form-group'><label data-i18n='ota_url_label'></label><input type='text' id='ota-url' placeholder='http://host/api/v1/repos/owner/repo/releases/latest'></div>"
 "    <button class='btn' onclick='saveOtaCfg()' data-i18n='ota_save_btn'>SAVE SETTINGS</button>"
 ""
@@ -1079,6 +1081,8 @@ static const char *html_page =
 " ota_auto:'Install new versions without asking',"
 " ota_auto_hint:'Off by default: a restart drops every client, so the device waits for you. With this on it installs as soon as it finds a newer release.',"
 " ota_url_label:'Release feed URL',ota_save_btn:'SAVE SETTINGS',"
+" ota_modified:'This firmware was built from a modified source tree, so it will not install updates automatically. Rebuild from a clean checkout to enable that, or set the feed to your own repository.',"
+" ota_buildrepo_label:'Built from',ota_repo_unknown:'(unknown source)',"
 " ota_check_btn:'CHECK FOR UPDATES',ota_checking:'Checking',ota_uptodate:'Up to date',"
 " ota_available:'Version {v} is available.',ota_install_btn:'INSTALL AND RESTART',"
 " ota_downloading:'Downloading',ota_installing:'Written and verified; restarting',"
@@ -1164,6 +1168,8 @@ static const char *html_page =
 " ota_auto:'发现新版本直接安装，不询问',"
 " ota_auto_hint:'默认关闭：重启会踢掉所有客户端，所以由你决定时机。开启后会一发现新版本就自动安装。',"
 " ota_url_label:'发布源地址',ota_save_btn:'保存设置',"
+" ota_modified:'本固件由已修改的源码构建，因此不会自动安装更新。若需要自动更新，请从干净的检出重新构建，或把发布源改到你自己的仓库。',"
+" ota_buildrepo_label:'构建来源',ota_repo_unknown:'（来源未知）',"
 " ota_check_btn:'检查更新',ota_checking:'检查中',ota_uptodate:'已是最新',"
 " ota_available:'发现新版本 {v}。',ota_install_btn:'安装并重启',"
 " ota_downloading:'下载中',ota_installing:'已写入并校验通过，正在重启',"
@@ -1951,7 +1957,16 @@ static const char *html_page =
 "    var h=document.getElementById('ota-hours');"
 "    if(h){h.value=String(d.interval_hours)}"
 "    var a=document.getElementById('ota-auto');"
-"    if(a){a.checked=!!d.auto_install}"
+"    if(a){"
+"      a.checked=!!d.auto_install;"
+"      /* A build with local modifications refuses to auto-install, so the"
+"         checkbox is disabled and the reason shown instead of springing back. */"
+"      a.disabled=!!d.modified;"
+"    }"
+"    var note=document.getElementById('ota-modified');"
+"    if(note){note.style.display=d.modified?'block':'none'}"
+"    var br=document.getElementById('ota-buildrepo');"
+"    if(br){br.value=d.build_repo||t('ota_repo_unknown')}"
 "    var u=document.getElementById('ota-url');"
 "    /* Never overwrite what the user is in the middle of typing. */"
 "    if(u&&document.activeElement!==u){u.value=d.url||''}"
@@ -3302,6 +3317,10 @@ static esp_err_t update_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "error", s.error);
     cJSON_AddNumberToObject(root, "interval_hours", s.interval_hours);
     cJSON_AddBoolToObject(root, "auto_install", s.auto_install);
+    /* A modified build refuses to auto-install, so the panel needs to say why
+     * rather than showing a checkbox that will not stay on. */
+    cJSON_AddBoolToObject(root, "modified", s.modified);
+    cJSON_AddStringToObject(root, "build_repo", s.build_repo);
     cJSON_AddNumberToObject(root, "progress", s.progress);
     /* Seconds since boot, so the UI can render "checked N minutes ago" without
      * the device needing a wall clock. 0 means never checked. */
@@ -3355,7 +3374,15 @@ static esp_err_t set_otacfg_post_handler(httpd_req_t *req)
         }
     }
     if (httpd_query_key_value(buf, "auto", raw_auto, sizeof(raw_auto)) == ESP_OK) {
-        fw_update_set_auto(raw_auto[0] == '1' || strcasecmp(raw_auto, "true") == 0);
+        bool want = (raw_auto[0] == '1' || strcasecmp(raw_auto, "true") == 0);
+        /* A refusal has to be reported. Answering 200 to an operation that did
+         * nothing leaves a switch that springs back with no explanation, which
+         * is the failure mode the guard exists to avoid. */
+        if (fw_update_set_auto(want) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "this firmware was built from a modified source tree");
+            return ESP_FAIL;
+        }
     }
     if (httpd_query_key_value(buf, "url", raw_url, sizeof(raw_url)) == ESP_OK) {
         char url_s[288] = {0};
