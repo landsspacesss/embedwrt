@@ -74,6 +74,38 @@ Two consequences worth knowing before you change the partition table:
   preserve the panel password, leases, DNS rules, port forwards, ACL and device
   records; NVS is not erased by `idf.py flash`. Moving it silently wipes the lot.
 
+### Developing: use a local feed, not CI
+
+**Do not drive development through GitHub Actions.** A round trip is about three
+minutes, and it only tells you what the build log says. Build locally and serve
+the feed from this machine:
+
+```sh
+idf.py build
+python3 tools/local_feed.py --version 1.4.7        # prints the URL to use
+```
+
+Then set the panel's release feed to the printed URL. The whole path - metadata,
+checksum, download, verify, flash, reboot - completes in about twenty seconds,
+and the checksum fetch is exercised too, which is the step that cannot be
+reached against GitHub from here.
+
+The URL must include the repository path, because the firmware reads its own
+identity out of the feed URL before trusting it:
+
+    http://<host>:<port>/<owner>/<repo>/releases/latest
+
+A bare `host:port` is refused by the provenance guard, which is the guard working.
+
+Two things to keep straight while testing: a panel session lives in RAM, so it
+is gone after every reboot and any script that keeps a cookie will start seeing
+401s and look like "the device did not come back". Log in again rather than
+concluding the device is down - that mistake cost real time here.
+
+CI is still how a *release* is built, because its value is a reproducible
+artifact built from the tagged source on a machine that is not this one. It is
+not the fast path, and should not be used as one.
+
 ### Releasing
 
 **Tag it, and GitHub Actions does the rest.** `v*` triggers
