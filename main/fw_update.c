@@ -649,10 +649,13 @@ static esp_err_t fw_http_get_open(const char *url, const char *accept,
             /* Name the host and the underlying error: this call can fail on any
              * hop, and "cannot connect" alone sent me hunting through three
              * layers of HTTP client to find out which one and why. */
-            char host[128];
+            char host[64];
             url_host(cur, host, sizeof(host));
             esp_http_client_cleanup(c);
-            snprintf(err, err_len, "cannot connect to %s: %s", host,
+            /* Explicit precisions on both: esp_err_to_name returns a string of
+             * unknown length, so without a bound the compiler cannot prove this
+             * fits and -Werror rejects it. */
+            snprintf(err, err_len, "cannot connect to %.48s: %.48s", host,
                      esp_err_to_name(oerr));
             return ESP_FAIL;
         }
@@ -1067,7 +1070,7 @@ static esp_err_t do_check(void)
         return ESP_ERR_NO_MEM;
     }
 
-    char err[96] = {0};
+    char err[FW_ERR_MAX] = {0};
     size_t n = 0;
     int status = 0;
     /* The release metadata is plain JSON; no Accept override. */
@@ -1186,7 +1189,7 @@ static esp_err_t do_install(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    char err[96] = {0};
+    char err[FW_ERR_MAX] = {0};
 
     /* The checksum first: it is tiny, and fetching it before the image means a
      * release whose checksum is unreachable costs nothing. */
