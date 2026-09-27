@@ -25,10 +25,19 @@
 #define TAG "fw_update"
 
 /*
- * What this firmware was built from, supplied by CMakeLists.txt. Empty when
- * there was no git to ask (a source tarball), which makes the build
- * unattributed - see the guard in do_check().
+ * What this firmware was built from: the repository, and whether the tree had
+ * local changes. Generated at build time by tools/gen_build_info.cmake, and
+ * empty/0 when there was no git to ask (a source tarball) - which makes the
+ * build unattributed so it will not accept an automatic update. See do_check().
+ *
+ * The fallbacks have to stay, or a missing generated header would be a build
+ * error instead of a conservative default.
  */
+#if defined(__has_include)
+#if __has_include("fw_build_info.h")
+#include "fw_build_info.h"
+#endif
+#endif
 #ifndef FW_BUILD_REPO
 #define FW_BUILD_REPO ""
 #endif
