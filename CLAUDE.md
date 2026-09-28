@@ -29,7 +29,8 @@ exposes JSON endpoints for every subsystem (`/api/clients`, `/api/leases`,
 `/api/dnsrules`, `/api/portmaps`, `/api/acl`, `/api/apcfg`, `/api/dnstest`,
 `/api/session`, `/api/version`, …). `/api/dnstest` is the one to reach for when a
 resolver appears broken: it runs a real query through each configured resolver
-using the same code the relay serves clients with.
+using the same code the relay serves clients with, and takes `?name=` to ask
+about a particular hostname rather than the default `example.com`.
 
 The device is reachable three ways, which is convenient for testing: from the
 upstream LAN (whatever address DHCP handed it), `http://192.168.4.1/` from a
@@ -57,7 +58,8 @@ first install. After that there are two routes into the same code:
 
 - **Settings → Firmware update** uploads `build/embedwrt.bin` by hand.
 - **The same panel section can check a release feed and install what it finds**,
-  either on a schedule or on a button. See "Automatic updates" below.
+  on a button always and on a schedule in release builds. See "Automatic updates"
+  below, and note that a development build has no schedule.
 
 Both go through the primitives in `fw_update.c`. **The payload is
 `build/embedwrt.bin`, the app image — not the merged full-flash image**, which
@@ -172,15 +174,10 @@ asking). Endpoints: `/api/update` (state), `/ota/check`, `/ota/install`,
 
 Design points that are deliberate:
 
-- **A build only updates from its own repository.** The firmware records which
-  repository it came from, and a feed belonging to a different one is refused
-  (`feed is 'x/y', this firmware is not`). Without this, a fork or a local edit
-  would be silently replaced by upstream's release, since the default feed points
-  upstream - not an update, just someone else's firmware.
-- **A build with uncommitted changes does not auto-install**, whatever the stored
-  setting says. The stored value is left alone rather than overwritten, so
-  rebuilding from a clean tree restores the user's choice instead of forgetting
-  it. Manual upload and the developer token still work: those are deliberate acts.
+- **A build only updates from its own repository, and only a release build
+  updates at all.** Both are properties of the build rather than run-time checks;
+  the paragraphs below on the development/release split are where that lives, and
+  they replaced the checks that used to enforce it.
 - **Version comparison is strict.** Only a greater version counts, so the running
   build is never an update of itself and auto-install cannot loop.
 - **Auto-install defaults off.** A restart drops every client, so the device
@@ -310,9 +307,9 @@ behind `MBEDTLS_ALLOW_PRIVATE_ACCESS`, so the familiar calls do not compile. Use
 (`psa/crypto.h`); the symbols are in libmbedcrypto already and go through the
 chip's SHA acceleration.
 
-**A reply with no `content-length` reads as length 0, not as empty.** A chunked
-reply (which is what both Gitea and GitHub send) makes
-`esp_http_client_fetch_headers()` return 0. Treating 0 as a real length made
+**A reply with no `content-length` reads as length 0, not as empty.** GitHub
+answers release metadata with a chunked reply, and
+`esp_http_client_fetch_headers()` returns 0 for that. Treating 0 as a real length made
 every check fail with "short read (5862 of 0 bytes)". With the length unknown the
 reply can also overflow the buffer, and truncating is the worse failure:
 `tag_name` sits *after* the release notes in that JSON, so a trimmed document
@@ -508,7 +505,8 @@ One NVS namespace, `"storage"`. Strings: `ssid`, `password` (upstream),
 `ap_ssid`, `ap_pass`, `ap_hidden`, `ap_maxconn`, `ap_txpower`, `doh_url`,
 `mdns_host`, `web_user`, `web_pass`, `ota_url`, `devtoken`. Blobs: `leases`,
 `dnsrules`, `pforwards`, `acl`, `devices`. Single bytes: `guestclaim`,
-`iotclrvis`, `otaauto`, `devmode`. Numbers: `otachk` (u32, hours).
+`iotclrvis`, `otaauto`, `devmode`, `bw20` (channel width). Numbers: `otachk`
+(u32, hours).
 
 The hot-path tables (`static_leases`, `dns_rules`, `ap_acl`, `devices`) are
 **double buffered**: readers follow an index and never take a lock, writers build
@@ -646,7 +644,8 @@ as `http://`.
 `master` holds the working repeater plus every feature: static leases, port
 forwarding, per-device DNS (DoH/DoT/plain), the client list, AP controls, mDNS,
 sessions with an admin/guest role split, MAC-keyed IoT ownership with the two
-claim policies above, and firmware update from the panel.
+claim policies above, and firmware update from the panel. It builds as either a
+development or a release build, and only the latter updates itself.
 
 **Verified on hardware:** NAT forwarding (11.87 Mbps at close range, measured
 server-side), DHCP including the awkward static-lease path, per-device DNS routing,
@@ -698,6 +697,13 @@ panel disables only the two automatic controls, and that a release build updates
 from a configured feed. The artifacts are confirmed; the running device has not
 been exercised since the change, because the board was unplugged.
 
+**Verified on hardware, the install path itself:** pointed at the local feed
+(`tools/local_feed.py`), the device completed the entire flow against a release
+build — metadata, checksum fetch, download, verify, write, reboot — and came up
+on the new version with the slot flipped. That includes the checksum fetch, the
+step that cannot be reached against GitHub from here, and it is what establishes
+that the firmware's half is sound and the GitHub failure is transport.
+
 **Verified on hardware, unattended install — blocked by the network, not the
 firmware:** the device reaches `api.github.com` and reports `up to date` against
 the live public feed, and it installs correctly when the image is pushed to it
@@ -710,10 +716,7 @@ DNS, and releasing a device it holds — has been exercised over HTTP but not
 through a browser on the AP since the guest view was reworked into collapsible
 cards. Rollback has been proven on the manual upload path, not separately on the
 automatic one; both call the same `fw_ota_finish`, so the mechanism is shared,
-but the auto path has not itself been handed a bad image. The device completing
-an end-to-end *automatic* install from the GitHub feed has not been observed
-either — the feed was pointed at GitHub only after the repo existed, and a
-private repo answers 404 to the device's anonymous request.
+but the auto path has not itself been handed a bad image.
 
 **Known limits of the update path:** a panel session lives in RAM, so an OTA
 restart logs the administrator out; that is expected and the UI says so. The
