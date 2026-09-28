@@ -255,14 +255,28 @@ static void load_settings(void)
     }
     nvs_close(h);
 
-    ESP_LOGI(TAG, "check every %u h, auto-install %s, developer mode %s",
+    /*
+     * A development build never installs on its own, even if the stored setting
+     * says so - the setting may have been made while running a release build.
+     * The stored value is left alone rather than overwritten, so going back to
+     * a release build restores the user's choice instead of forgetting it.
+     */
+    if (!FW_RELEASE_BUILD && s_auto_install) {
+        s_auto_install = false;
+    }
+
+    ESP_LOGI(TAG, "check every %u h, auto-install %s, developer mode %s, %s",
              (unsigned)s_interval_hours, s_auto_install ? "on" : "off",
-             s_dev_mode ? "ENABLED" : "off");
+             s_dev_mode ? "ENABLED" : "off",
+             FW_RELEASE_BUILD ? "release build" : "development build");
 }
 
 esp_err_t fw_update_set_interval(uint32_t hours)
 {
-    if (!FW_RELEASE_BUILD) {
+    /* No automatic checks happen in a development build, so a non-zero
+     * interval would be a setting that does nothing. Turning it off is always
+     * allowed, since that is already the behaviour. */
+    if (!FW_RELEASE_BUILD && hours != 0) {
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (hours > 24 * 30) {
@@ -1152,20 +1166,20 @@ static esp_err_t do_install(void)
 
 /* ======================= task ======================= */
 
+/*
+ * Both work in a development build too. Developing the update path means
+ * pointing the device at a test feed and pushing a build - which is exactly
+ * what these two are for. What a development build refuses is doing it on its
+ * own.
+ */
 esp_err_t fw_update_check_now(void)
 {
-    if (!FW_RELEASE_BUILD) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     xEventGroupSetBits(s_eg, UPD_CHECK_BIT);
     return ESP_OK;
 }
 
 esp_err_t fw_update_install_now(void)
 {
-    if (!FW_RELEASE_BUILD) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
     xEventGroupSetBits(s_eg, UPD_INSTALL_BIT);
     return ESP_OK;
 }
@@ -1218,7 +1232,13 @@ static void fw_update_task(void *arg)
          * "off" really means no unsolicited traffic. */
         TickType_t wait;
         bool will_check;
-        if (!first_check_done && hours > 0) {
+        if (!FW_RELEASE_BUILD) {
+            /* A development build never checks on its own. The task still
+             * blocks here so the manual actions still work - it just wakes to
+             * an idle timeout and goes back to waiting. */
+            wait = pdMS_TO_TICKS(60 * 1000);
+            will_check = false;
+        } else if (!first_check_done && hours > 0) {
             wait = pdMS_TO_TICKS(2 * 60 * 1000);
             will_check = true;
         } else if (hours == 0) {
@@ -1249,7 +1269,10 @@ static void fw_update_task(void *arg)
         auto_on = s_auto_install;
         xSemaphoreGive(s_lock);
 
-        if (found == ESP_OK && auto_on) {
+        /* The channel is checked here as well as at load time: this is the
+         * line that replaces someone's firmware without being asked, so it
+         * should not depend on one earlier assignment staying correct. */
+        if (FW_RELEASE_BUILD && found == ESP_OK && auto_on) {
             ESP_LOGW(TAG, "auto-install is on and a newer version exists");
             do_install();
         }
@@ -1274,15 +1297,13 @@ void fw_update_init(void)
     load_settings();
 
     /*
-     * A development build has no update path at all: no task, no scheduled
-     * traffic, nothing that could replace this firmware with a release. The
-     * panel hides the section, so this is not the only thing standing between a
-     * developer and a surprise update - but it is the one that cannot be
-     * bypassed from the network.
+     * A development build keeps the whole manual path - the section, checking,
+     * installing - and loses only the automatic part. Testing the update flow
+     * from a local feed is a normal thing to do while working on it, so the
+     * task still runs; it just never acts on its own (see the schedule below).
      */
     if (!FW_RELEASE_BUILD) {
-        ESP_LOGW(TAG, "development build: automatic updates are disabled");
-        return;
+        ESP_LOGW(TAG, "development build: automatic updates are off, manual still works");
     }
 
     /* Idempotent, and esp-tls may already have done it. Called here so hashing

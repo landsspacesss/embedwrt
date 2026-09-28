@@ -196,7 +196,7 @@ input:focus,select:focus{border-color:#3b82f6}
 
     <div id='ota-devb' class='hint' style='display:none;margin:0 0 10px;color:#b45309' data-i18n='ota_devbuild'></div>
 
-    <div id='ota-release-only' style='display:none'>
+    <div>
       <div class='form-group'><label data-i18n='ota_freq'></label>
         <select id='ota-hours'>
           <option value='0' data-i18n='ota_freq_off'>Off</option>
@@ -313,7 +313,7 @@ en:{
  ota_auto:'Install new versions without asking',
  ota_auto_hint:'Off by default: a restart drops every client, so the device waits for you. With this on it installs as soon as it finds a newer release.',
  ota_url_label:'Release feed URL',ota_save_btn:'SAVE SETTINGS',
- ota_devbuild:'This is a development build, so it does not update itself. Automatic updates are built in only for release builds, which is what CI produces on a tag.',
+ ota_devbuild:'This is a development build, so it never checks or installs on its own. Checking and installing by hand still work, which is what you want while working on the update path. Automatic updating is compiled in only for release builds - what CI produces on a tag.',
  ota_buildrepo_label:'Built from',ota_repo_unknown:'(unknown source)',
  ota_check_btn:'CHECK FOR UPDATES',ota_checking:'Checking',ota_uptodate:'Up to date',
  ota_available:'Version {v} is available.',ota_install_btn:'INSTALL AND RESTART',
@@ -400,7 +400,7 @@ zh:{
  ota_auto:'发现新版本直接安装，不询问',
  ota_auto_hint:'默认关闭：重启会踢掉所有客户端，所以由你决定时机。开启后会一发现新版本就自动安装。',
  ota_url_label:'发布源地址',ota_save_btn:'保存设置',
- ota_devbuild:'这是开发构建，不会自行更新。自动更新只编译进正式发布版本，也就是 CI 在打 tag 时产出的那一版。',
+ ota_devbuild:'这是开发构建，不会自行检查或安装更新。手动检查和手动安装仍然可用 —— 开发更新功能时正是需要这个。自动更新只编译进正式发布版本，也就是 CI 在打 tag 时产出的那一版。',
  ota_buildrepo_label:'构建来源',ota_repo_unknown:'（来源未知）',
  ota_check_btn:'检查更新',ota_checking:'检查中',ota_uptodate:'已是最新',
  ota_available:'发现新版本 {v}。',ota_install_btn:'安装并重启',
@@ -1189,17 +1189,17 @@ function loadUpdateInfo(){
     var h=document.getElementById('ota-hours');
     if(h){h.value=String(d.interval_hours)}
     var a=document.getElementById('ota-auto');
-    /* A development build has no update path at all, so the whole section is
-       hidden rather than shown with controls that cannot work. Someone who
-       built this themselves gets told why. */
+    /* A development build keeps checking and installing by hand - that is how
+       the update path gets tested - and loses only the automatic part. So the
+       two controls that describe automatic behaviour are disabled and explained
+       rather than the whole section disappearing. */
     var dev=!d.release_build;
-    var sec=document.getElementById('ota-release-only');
-    if(sec){sec.style.display=dev?'none':'block'}
     var devNote=document.getElementById('ota-devb');
     if(devNote){devNote.style.display=dev?'block':'none'}
-    if(dev){return}
+    var h=document.getElementById('ota-hours');
+    if(h){h.disabled=dev}
 
-    if(a){a.checked=!!d.auto_install}
+    if(a){a.checked=!!d.auto_install; a.disabled=dev}
     var br=document.getElementById('ota-buildrepo');
     if(br){br.value=d.build_repo||t('ota_repo_unknown')}
     var u=document.getElementById('ota-url');

@@ -102,11 +102,12 @@ idf.py build                            # development: no update path
 idf.py -DEMBEDWRT_RELEASE=ON build      # release: updates from your repository
 ```
 
-A **development build** cannot update itself: the code is not compiled in, the
-panel hides the update section, and the endpoints refuse. That is the default, so
-working on the firmware can never end with your changes quietly replaced by a
-release. Its version carries a `-dev` suffix, and the release tooling refuses to
-publish one.
+A **development build** never updates itself: no scheduled checks, no automatic
+install. Checking and installing by hand still work - that is how the update path
+gets tested - so the panel keeps the section and disables only the frequency
+selector and the auto-install switch. This is the default, so working on the
+firmware can never end with your changes quietly replaced by a release. Its
+version carries a `-dev` suffix, and the release tooling refuses to publish one.
 
 A **release build** checks the `releases/latest` endpoint of the repository it
 was built from, which CI supplies from `$GITHUB_REPOSITORY`. A fork therefore

@@ -197,10 +197,18 @@ Design points that are deliberate:
   unverified, so the checksum asset is not optional on the publishing side.
 
 **Development and release are separate builds, and the split is what removed the
-runtime guard.** A *release* build can update itself; a *development* build has no
-update path at all - `fw_update_task` is not even linked in, because nothing
-references it, so the code is absent rather than disabled by a flag. The panel
-hides the section and says why.
+runtime guard.** A *release* build updates itself; a *development* build never
+does anything on its own - no scheduled checks, no auto-install. Everything
+manual still works in both: the panel section, checking, and installing. That is
+deliberate, because developing the update path means pointing the device at a
+test feed and pushing a build.
+
+Four places enforce it, and the redundancy is intentional for the one that
+matters: the scheduler never sets `will_check`, `load_settings` clears
+`auto_install` (leaving the stored value alone), `fw_update_set_interval`
+refuses a non-zero interval, and the auto-install call itself is guarded. That
+last one replaces someone's firmware without being asked, so it should not
+depend on one earlier assignment staying correct.
 
 The earlier design shipped one binary and decided at run time whether its feed
 could be trusted. That needed heuristics - which repository the build came from,
@@ -211,6 +219,12 @@ Here the answer is a property of how the artifact was produced:
 idf.py build                            # development
 idf.py -DEMBEDWRT_RELEASE=ON build      # release
 ```
+
+The panel keeps the update section in a development build and disables the two
+controls that describe automatic behaviour - the frequency selector and
+auto-install - with a note saying why. Hiding the section was the first attempt
+and was wrong: it made the update path untestable from a development build,
+which is exactly when you need to test it.
 
 `FW_DEFAULT_REPO` comes from `EMBEDWRT_REPO`, which CI sets from
 `$GITHUB_REPOSITORY`. So a fork's release build points at the fork with nothing
@@ -230,9 +244,10 @@ the top level does **not** reach an ESP-IDF component, and the failure is silent
 (the macro stays undefined, the release build behaves like a development one);
 they have to be attached in `main/CMakeLists.txt` with
 `target_compile_definitions`. And a cache variable has to be read before
-`project()`, because `PROJECT_VER` is consumed there. Verify by comparing the two
-images - `strings build/embedwrt.bin | grep 'auto-update from'` is present in a
-release build and absent in a development one - not by reading the build log.
+`project()`, because `PROJECT_VER` is consumed there. Verify by comparing the two images, not by
+reading the build log: the versions differ (`1.5.0` against `1.5.0-dev`), and
+`strings build/embedwrt.bin | grep 'development build: automatic updates are
+off'` appears in a development build and not in a release one.
 
 **The release CDN is unreachable from the device on this network, and that is
 not a firmware problem.** `release-assets.githubusercontent.com` — where every
@@ -672,17 +687,16 @@ invalidates the old one immediately, disabling developer mode invalidates a
 valid one, and settings plus token survive a reboot. The panel section renders
 correctly in both languages.
 
-**Verified by building both channels:** the dev build does not contain
-`fw_update_task` at all (the linker drops it, nothing references it) and carries
-`automatic updates are disabled`; the release build carries `auto-update from`
-and lacks the dev message. A dev build reports version `1.5.0-dev` and
-`make_release.py` refuses to publish it. The two images differ by about 10 KB.
+**Verified by building both channels:** a dev build reports `1.5.0-dev` and
+carries the development-build message while a release build does not, and
+`make_release.py` refuses to publish the dev one. Both link the update task,
+since manual checking and installing work in either.
 
-**Not yet verified on hardware:** the dev/release channel behaviour at run time -
-that a dev build's panel hides the update section and that its endpoints refuse,
-and that a release build updates from a configured feed. The code paths and the
-artifacts are confirmed; the running device has not been exercised since the
-change, because the board was unplugged.
+**Not yet verified on hardware:** the dev/release behaviour at run time - that a
+dev build never checks on its own but still checks and installs by hand, that its
+panel disables only the two automatic controls, and that a release build updates
+from a configured feed. The artifacts are confirmed; the running device has not
+been exercised since the change, because the board was unplugged.
 
 **Verified on hardware, unattended install — blocked by the network, not the
 firmware:** the device reaches `api.github.com` and reports `up to date` against
