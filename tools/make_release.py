@@ -166,6 +166,15 @@ def main():
 
     emb = embedded_version(APP_BIN)
     if emb != ver:
+        # A development build carries a "-dev" suffix, and publishing one would
+        # ship a release with automatic updates compiled out - invisible until a
+        # device refused to update itself. Worth its own message, because the
+        # generic one sends you looking at the tag.
+        if emb == f"{ver}-dev":
+            sys.exit(f"FATAL: {APP_BIN} is a development build (version '{emb}').\n"
+                     f"       Development builds cannot update themselves, so publishing this\n"
+                     f"       would ship a release that never updates.\n"
+                     f"       Rebuild as a release:  idf.py -DEMBEDWRT_RELEASE=ON build")
         sys.exit(f"FATAL: {APP_BIN} reports version '{emb}' but PROJECT_VER is '{ver}'.\n"
                  f"       Rebuild before publishing, or the tag and the image disagree.")
     print(f"image descriptor version matches PROJECT_VER ({emb})")

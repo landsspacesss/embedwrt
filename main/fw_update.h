@@ -117,11 +117,11 @@ typedef struct {
     char slot[24];         /* partition this build is running from */
     uint32_t interval_hours;   /* 0 = periodic checks are off */
     bool auto_install;
-    /* This build has uncommitted source changes. Auto-install is forced off:
-       the whole point of an edit is that it should not be silently replaced.
-       The panel shows why, and offers to re-enable once the tree is clean. */
-    bool modified;
-    /* The repository this firmware came from, "owner/repo" ("" if unknown). */
+    /* A release build can update itself; a development build cannot, and the
+       panel disables the whole section rather than offering controls that do
+       nothing. Decided when the artifact was built, not inferred at runtime. */
+    bool release_build;
+    /* The repository this build updates from, "owner/repo" ("" if unknown). */
     char build_repo[64];
     char url[256];
     char error[FW_ERR_MAX];

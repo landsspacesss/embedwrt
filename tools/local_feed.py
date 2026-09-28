@@ -9,16 +9,19 @@ It is not only a convenience. The GitHub release CDN is unreachable from some
 networks (see CLAUDE.md), so a local feed is the only way to test an unattended
 install there at all.
 
-The URL matters. The firmware refuses a feed whose repository does not match the
-one it was built from, and that identity is read out of the URL path - so the
-feed must be mounted under `<owner>/<repo>`, exactly as GitHub's is:
+The URL carries the repository path so it mirrors a real feed:
 
     http://<host>:<port>/landsspacesss/embedwrt/releases/latest
 
-Point the panel's release feed at that and the guard is satisfied.
+Nothing requires that any more - the runtime repository check is gone - but a URL
+shaped like the one you ship with is one less difference to explain.
 
-    python3 tools/local_feed.py --version 1.4.7
-    python3 tools/local_feed.py --version 1.4.7 --image build/embedwrt.bin
+The build has to be a release build (`idf.py -DEMBEDWRT_RELEASE=ON build`), and
+`--version` has to be higher than what the device runs: a development build has
+no update path at all, and the version comparison is strict.
+
+    python3 tools/local_feed.py --version 1.5.1
+    python3 tools/local_feed.py --version 1.5.1 --image build/embedwrt.bin
 """
 import argparse
 import hashlib
@@ -31,8 +34,8 @@ import sys
 import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Mirrors the repository this project is built from, so the firmware's
-# provenance check accepts the feed. Override with --repo if you forked.
+# Mirrors the repository this project is built from, so the feed URL looks like
+# the one the firmware would use in the field. Override with --repo if you forked.
 DEFAULT_REPO = "landsspacesss/embedwrt"
 
 
@@ -165,8 +168,7 @@ def main():
         print("  set the panel's release feed to:")
         print("    %s" % url)
         print()
-        print("  (the URL must carry the repository path or the firmware's")
-        print("   provenance check will refuse it)")
+        print("  (release build required; --version must exceed the running one)")
         httpd.serve_forever()
 
 

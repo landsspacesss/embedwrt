@@ -25,24 +25,20 @@
 #define TAG "fw_update"
 
 /*
- * What this firmware was built from: the repository, and whether the tree had
- * local changes. Generated at build time by tools/gen_build_info.cmake, and
- * empty/0 when there was no git to ask (a source tarball) - which makes the
- * build unattributed so it will not accept an automatic update. See do_check().
+ * Build channel, set by CMakeLists.txt. A development build has no update path
+ * at all: no task, no checking, no installing. That is deliberate rather than
+ * cautious - a build someone is working on is exactly the one that should not
+ * be replaced by a release, and deciding it here means the runtime never has to
+ * guess whether its feed can be trusted.
  *
- * The fallbacks have to stay, or a missing generated header would be a build
- * error instead of a conservative default.
+ * The fallbacks keep a missing definition a development build, which is the
+ * safe direction to fail in.
  */
-#if defined(__has_include)
-#if __has_include("fw_build_info.h")
-#include "fw_build_info.h"
+#ifndef FW_RELEASE_BUILD
+#define FW_RELEASE_BUILD 0
 #endif
-#endif
-#ifndef FW_BUILD_REPO
-#define FW_BUILD_REPO ""
-#endif
-#ifndef FW_BUILD_DIRTY
-#define FW_BUILD_DIRTY 0
+#ifndef FW_DEFAULT_REPO
+#define FW_DEFAULT_REPO ""
 #endif
 
 #define NVS_NAMESPACE "storage"
@@ -58,21 +54,30 @@ static bool s_dev_mode;
 static char s_dev_token[FW_DEV_TOKEN_LEN];
 
 /*
- * Where to ask by default. A "latest release" endpoint rather than a file, so
- * publishing a release is all it takes to make a new version visible - no
- * firmware change and no URL to edit.
+ * Where to ask by default: the "latest release" endpoint of the repository this
+ * build came from. A feed rather than a file name, so publishing a release is
+ * all it takes to make a version visible.
  *
- * GitHub rather than a LAN server for two reasons: it is not a machine in this
- * house that can be switched off, and the repository is public so no token is
- * involved (the endpoint is readable anonymously). Unauthenticated GitHub API
- * access allows 60 requests an hour per address; one check a day is far below
- * that.
+ * The repository is compiled in by CI from $GITHUB_REPOSITORY, so a fork's
+ * release build points at the fork with nothing to configure, and a device is
+ * never offered a firmware built from someone else's repository. That is the
+ * property the runtime repository check used to provide, obtained by
+ * construction instead of by inspection.
  *
- * Overridable from the panel, so a fork, another network or a self-hosted
- * mirror all work without rebuilding.
+ * Overridable from the panel, so another network or a self-hosted mirror needs
+ * no rebuild.
  */
-#define DEFAULT_URL \
-    "https://api.github.com/repos/landsspacesss/embedwrt/releases/latest"
+static char s_default_url[160];
+
+static void build_default_url(void)
+{
+    if (FW_DEFAULT_REPO[0] == '\0') {
+        s_default_url[0] = '\0';   /* no repository known: nothing to point at */
+        return;
+    }
+    snprintf(s_default_url, sizeof(s_default_url),
+             "https://api.github.com/repos/%s/releases/latest", FW_DEFAULT_REPO);
+}
 
 /*
  * Cap on the release metadata. A release document includes its notes and one
@@ -101,7 +106,7 @@ static EventGroupHandle_t s_eg;
  * these plus the runtime state. */
 static uint32_t s_interval_hours = 24;
 static bool     s_auto_install;
-static char     s_url[256] = DEFAULT_URL;
+static char     s_url[256];
 
 /* Runtime state, all guarded by s_lock. */
 static fw_state_t s_state = FW_IDLE;
@@ -239,7 +244,7 @@ static void load_settings(void)
     }
     size_t len = sizeof(s_url);
     if (nvs_get_str(h, NVS_KEY_URL, s_url, &len) != ESP_OK || s_url[0] == '\0') {
-        snprintf(s_url, sizeof(s_url), "%s", DEFAULT_URL);
+        snprintf(s_url, sizeof(s_url), "%s", s_default_url);
     }
     if (nvs_get_u8(h, NVS_KEY_DEVMODE, &u8) == ESP_OK) {
         s_dev_mode = (u8 != 0);
@@ -250,17 +255,6 @@ static void load_settings(void)
     }
     nvs_close(h);
 
-    /*
-     * A build with uncommitted changes does not auto-install, whatever the
-     * stored setting says. The stored value is left alone rather than
-     * overwritten, so rebuilding from a clean tree restores the user's choice
-     * instead of silently forgetting it.
-     */
-    if (FW_BUILD_DIRTY && s_auto_install) {
-        s_auto_install = false;
-        ESP_LOGW(TAG, "this build has local modifications, so auto-install is off");
-    }
-
     ESP_LOGI(TAG, "check every %u h, auto-install %s, developer mode %s",
              (unsigned)s_interval_hours, s_auto_install ? "on" : "off",
              s_dev_mode ? "ENABLED" : "off");
@@ -268,6 +262,9 @@ static void load_settings(void)
 
 esp_err_t fw_update_set_interval(uint32_t hours)
 {
+    if (!FW_RELEASE_BUILD) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (hours > 24 * 30) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -293,8 +290,11 @@ esp_err_t fw_update_set_auto(bool on)
 {
     /* Refused rather than quietly ignored: a switch that springs back with no
      * explanation is worse than one that says why. The panel reports this. */
-    if (on && FW_BUILD_DIRTY) {
-        ESP_LOGW(TAG, "cannot enable auto-install: this build has local modifications");
+    if (on && !FW_RELEASE_BUILD) {
+        /* A development build has no update path, so this setting would have
+         * nothing to act on. Refused rather than silently stored, so the panel
+         * can say why instead of showing a switch that springs back. */
+        ESP_LOGW(TAG, "cannot enable auto-install: this is a development build");
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -315,6 +315,9 @@ esp_err_t fw_update_set_auto(bool on)
 
 esp_err_t fw_update_set_url(const char *url)
 {
+    if (!FW_RELEASE_BUILD) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (url == NULL || url[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -898,124 +901,6 @@ done:
 
 /* ======================= check ======================= */
 
-/*
- * Reduce a repository reference to "owner/repo", lowercase.
- *
- * Both sides of the comparison need the same shape: a feed URL is an API path
- * (`.../repos/owner/repo/releases/latest`, on GitHub or Gitea) while the build
- * origin is a clone URL (`https://host/owner/repo.git` or
- * `git@host:owner/repo`). Comparing those two strings directly would never
- * match, and the mismatch would look like a bug in the guard rather than the
- * point of it.
- *
- * Returns false when nothing identifiable is present.
- */
-static bool repo_identity(const char *url, char *out, size_t out_len)
-{
-    if (url == NULL || out_len == 0) {
-        return false;
-    }
-    out[0] = '\0';
-
-    /* Skip any scheme, and turn git@host:owner/repo into host/owner/repo. */
-    const char *p = url;
-    const char *colon = NULL;
-    for (const char *q = url; *q; q++) {
-        if (*q == '/' || *q == ':') {
-            colon = q;
-            break;
-        }
-    }
-    const char *scheme_end = strstr(url, "://");
-    if (scheme_end != NULL) {
-        p = scheme_end + 3;
-    } else if (colon != NULL && colon > url && colon[-1] != '/') {
-        p = url;   /* scp-like: git@host:owner/repo */
-    }
-
-    /* Copy the path, dropping query and fragment, so it can be split. */
-    char path[FW_URL_MAX];
-    snprintf(path, sizeof(path), "%s", p);
-    for (char *c = path; *c; c++) {
-        if (*c == '?' || *c == '#') {
-            *c = '\0';
-            break;
-        }
-    }
-
-    /* Collect up to 8 path segments after turning ':' separators into '/'. */
-    char *seg[8];
-    int nseg = 0;
-    for (char *c = path; *c && nseg < 8; ) {
-        while (*c == '/' || *c == ':') {
-            *c++ = '\0';
-        }
-        if (*c == '\0') {
-            break;
-        }
-        seg[nseg++] = c;
-        while (*c && *c != '/' && *c != ':') {
-            c++;
-        }
-    }
-    if (nseg < 2) {
-        return false;
-    }
-
-    /* Drop a ".git" suffix and any trailing "releases/..." or "tags/...". */
-    size_t last = strlen(seg[nseg - 1]);
-    if (last > 4 && strcasecmp(seg[nseg - 1] + last - 4, ".git") == 0) {
-        seg[nseg - 1][last - 4] = '\0';
-    }
-    for (int i = 0; i < nseg; i++) {
-        if (strcasecmp(seg[i], "releases") == 0 || strcasecmp(seg[i], "tags") == 0) {
-            nseg = i;
-            break;
-        }
-    }
-    /*
-     * An API path has a "repos" segment and the owner/repo follow it; a clone
-     * URL has neither, and owner/repo are the LAST two segments. Defaulting to
-     * the last two and only overriding on "repos" is what makes
-     * https://host/owner/repo.git comparable with
-     * https://api.host/repos/owner/repo/releases/latest - taking the first two
-     * instead would yield "host/owner", which never matches anything.
-     */
-    int from = nseg - 2;
-    for (int i = 0; i < nseg; i++) {
-        if (strcasecmp(seg[i], "repos") == 0 && nseg - (i + 1) >= 2) {
-            from = i + 1;
-            break;
-        }
-    }
-
-    snprintf(out, out_len, "%s/%s", seg[from], seg[from + 1]);
-    for (char *c = out; *c; c++) {
-        *c = (char)tolower((unsigned char)*c);
-    }
-    return true;
-}
-
-/*
- * May this firmware install what the configured feed serves?
- *
- * The feed and the build must belong to the same repository. A fork carries its
- * own origin, so the default feed - upstream - stops being an update and
- * becomes someone else's firmware, which is exactly the mistake worth refusing.
- * A user who really wants to track upstream can change the feed to match, which
- * is a deliberate act rather than a default.
- */
-static bool feed_matches_build(const char *feed_url, char *feed_id, size_t feed_len)
-{
-    char build_id[128];
-    bool have_feed = repo_identity(feed_url, feed_id, feed_len);
-    bool have_build = repo_identity(FW_BUILD_REPO, build_id, sizeof(build_id));
-
-    if (!have_feed || !have_build) {
-        return false;
-    }
-    return strcmp(feed_id, build_id) == 0;
-}
 
 /*
  * Where to fetch one release asset from.
@@ -1053,32 +938,6 @@ static esp_err_t do_check(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     snprintf(url, sizeof(url), "%s", s_url);
     xSemaphoreGive(s_lock);
-
-    /*
-     * Refuse a feed that is not this build's own repository. Doing it here
-     * rather than at install time means the panel explains it on the check
-     * - the user sees why nothing is happening instead of finding that the
-     * install button quietly does nothing.
-     */
-    {
-        char feed_id[128];
-        if (!feed_matches_build(url, feed_id, sizeof(feed_id))) {
-            /* Sized for the identity embedded above, not for a typical one:
-             * snprintf is checked against the declared size, and -Werror turns
-             * a possible truncation into a build failure. */
-            char msg[FW_ERR_MAX];
-            if (FW_BUILD_REPO[0] == '\0') {
-                snprintf(msg, sizeof(msg), "built without a repository; "
-                                           "set the feed for your own");
-            } else {
-                snprintf(msg, sizeof(msg), "feed is '%s', this firmware is not",
-                         feed_id[0] ? feed_id : "unrecognised");
-            }
-            ESP_LOGW(TAG, "refusing feed: %s", msg);
-            set_state(FW_ERROR, msg);
-            return ESP_FAIL;
-        }
-    }
 
     char *json = malloc(FW_JSON_MAX);
     if (json == NULL) {
@@ -1295,12 +1154,18 @@ static esp_err_t do_install(void)
 
 esp_err_t fw_update_check_now(void)
 {
+    if (!FW_RELEASE_BUILD) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     xEventGroupSetBits(s_eg, UPD_CHECK_BIT);
     return ESP_OK;
 }
 
 esp_err_t fw_update_install_now(void)
 {
+    if (!FW_RELEASE_BUILD) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     xEventGroupSetBits(s_eg, UPD_INSTALL_BIT);
     return ESP_OK;
 }
@@ -1327,10 +1192,10 @@ void fw_update_status(fw_status_t *out)
     const esp_partition_t *run = esp_ota_get_running_partition();
     snprintf(out->slot, sizeof(out->slot), "%s", run ? run->label : "");
 
-    out->modified = FW_BUILD_DIRTY;
-    if (!repo_identity(FW_BUILD_REPO, out->build_repo, sizeof(out->build_repo))) {
-        out->build_repo[0] = '\0';
-    }
+    /* Whether this build can update itself at all. A development build reports
+     * false, and the panel disables the whole section on it. */
+    out->release_build = (FW_RELEASE_BUILD != 0);
+    snprintf(out->build_repo, sizeof(out->build_repo), "%s", FW_DEFAULT_REPO);
 }
 
 static void fw_update_task(void *arg)
@@ -1405,7 +1270,20 @@ void fw_update_init(void)
         return;
     }
 
+    build_default_url();
     load_settings();
+
+    /*
+     * A development build has no update path at all: no task, no scheduled
+     * traffic, nothing that could replace this firmware with a release. The
+     * panel hides the section, so this is not the only thing standing between a
+     * developer and a surprise update - but it is the one that cannot be
+     * bypassed from the network.
+     */
+    if (!FW_RELEASE_BUILD) {
+        ESP_LOGW(TAG, "development build: automatic updates are disabled");
+        return;
+    }
 
     /* Idempotent, and esp-tls may already have done it. Called here so hashing
      * does not depend on whether a TLS connection happened to come first. */

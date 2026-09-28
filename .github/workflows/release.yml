@@ -46,6 +46,15 @@ jobs:
           # project is developed against 6.1.
           esp_idf_version: release-v6.1
           target: esp32s3
+          # This is what makes it a release rather than a development build:
+          # the update path is compiled in, and the feed is this repository.
+          # $GITHUB_REPOSITORY is owner/repo, so a fork's release points at the
+          # fork with nothing to configure - a device is never offered a
+          # firmware built from somebody else's repository.
+          command: >-
+            idf.py -DEMBEDWRT_RELEASE=ON
+            -DEMBEDWRT_REPO=${{ github.repository }}
+            build
 
       # The action runs its build in a container without --user, so everything it
       # wrote is owned by root. Later steps run as the runner user and cannot

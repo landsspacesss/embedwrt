@@ -6,8 +6,8 @@ An ESP32-S3 WiFi repeater. It joins an upstream network as a station,
 re-broadcasts it on its own access point, and NATs between the two. Client DNS is
 answered locally and forwarded over DNS-over-HTTPS or DNS-over-TLS, so lookups do
 not cross the upstream link in plaintext. Everything is configured from a web
-panel with an administrator/guest split, and the firmware updates itself over the
-network.
+panel with an administrator/guest split. Release builds update themselves over
+the network; development builds do not.
 
 One binary, no OS. The target is an ESP32-S3 with 16 MB flash and 8 MB PSRAM
 (developed on a Waveshare ESP32-S3-DevKit N16R8).
@@ -32,8 +32,8 @@ One binary, no OS. The target is an ESP32-S3 with 16 MB flash and 8 MB PSRAM
 - **IoT ownership** — flag a device as IoT and assign an owner, so it can be
   managed by that owner without a panel login
 - **mDNS** — reachable at `http://<hostname>.local/`
-- **Firmware update from the panel**, and **automatic updates** from a GitHub
-  release feed
+- **Firmware update from the panel**, and in release builds **automatic updates**
+  from a GitHub release feed
 - **Developer mode** — flash with an API token instead of a login, for scripting
 - **Bilingual panel** (English / Chinese)
 
@@ -93,21 +93,28 @@ The image is verified against the release's `embedwrt.bin.sha256` before the boo
 partition is switched, and a release without that asset is refused rather than
 installed unverified.
 
-**Forking or editing this?** `DEFAULT_URL` in `main/fw_update.c` points at this
-repository, so a device built from a fork would otherwise offer to replace its
-own firmware with upstream's. That is refused rather than merely discouraged: the
-build records which repository it came from, and a feed belonging to a different
-one is rejected.
+### Development and release builds
 
-```
-feed is 'landsspacesss/embedwrt', this firmware is not
+There are two kinds of build, and they differ in whether updates exist at all.
+
+```sh
+idf.py build                            # development: no update path
+idf.py -DEMBEDWRT_RELEASE=ON build      # release: updates from your repository
 ```
 
-To update from your own releases, set the feed URL in the panel to your
-repository. A build with uncommitted changes is treated the same way — it will
-not install updates automatically, because the point of an edit is that it should
-not be silently overwritten. Manual upload and the developer-mode token still
-work, since those are deliberate acts.
+A **development build** cannot update itself: the code is not compiled in, the
+panel hides the update section, and the endpoints refuse. That is the default, so
+working on the firmware can never end with your changes quietly replaced by a
+release. Its version carries a `-dev` suffix, and the release tooling refuses to
+publish one.
+
+A **release build** checks the `releases/latest` endpoint of the repository it
+was built from, which CI supplies from `$GITHUB_REPOSITORY`. A fork therefore
+updates from the fork with nothing to configure, and a device is never offered a
+firmware built from somebody else's repository.
+
+Manual upload from the panel, and the developer token described below, work in
+both - they are deliberate acts, not automatic ones.
 
 ### Developer mode
 

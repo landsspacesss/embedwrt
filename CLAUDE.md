@@ -81,8 +81,8 @@ minutes, and it only tells you what the build log says. Build locally and serve
 the feed from this machine:
 
 ```sh
-idf.py build
-python3 tools/local_feed.py --version 1.4.7        # prints the URL to use
+idf.py -DEMBEDWRT_RELEASE=ON build          # a release build: updates exist
+python3 tools/local_feed.py --version 1.5.1 # prints the URL to use
 ```
 
 Then set the panel's release feed to the printed URL. The whole path - metadata,
@@ -90,17 +90,25 @@ checksum, download, verify, flash, reboot - completes in about twenty seconds,
 and the checksum fetch is exercised too, which is the step that cannot be
 reached against GitHub from here.
 
-The URL must include the repository path, because the firmware reads its own
-identity out of the feed URL before trusting it:
+**The build has to be a release build, or there is nothing to test.** A
+development build has no update path, so pointing one at a local feed produces a
+panel section that is hidden and endpoints that refuse. That is the design
+working, but it is also the first thing that will look like a bug.
 
-    http://<host>:<port>/<owner>/<repo>/releases/latest
+The feed URL happens to carry the repository path
+(`.../<owner>/<repo>/releases/latest`) because it mirrors the real feed shape.
+Nothing enforces that any more - the runtime repository check is gone - but a URL
+that looks like the one you ship with is one less difference to explain.
 
-A bare `host:port` is refused by the provenance guard, which is the guard working.
+Two more things that cost time here:
 
-Two things to keep straight while testing: a panel session lives in RAM, so it
-is gone after every reboot and any script that keeps a cookie will start seeing
-401s and look like "the device did not come back". Log in again rather than
-concluding the device is down - that mistake cost real time here.
+- **A panel session lives in RAM**, so it is gone after every reboot and any
+  script that keeps a cookie starts seeing 401s. That reads as "the device did
+  not come back", and did twice during this work. Log in again before concluding
+  anything.
+- **`--version` must be higher than the running build.** The comparison is
+  strict, so a local feed advertising the same version the device already runs
+  reports "up to date" and there is nothing to install.
 
 CI is still how a *release* is built, because its value is a reproducible
 artifact built from the tagged source on a machine that is not this one. It is
@@ -188,35 +196,43 @@ Design points that are deliberate:
 - **A release without `embedwrt.bin.sha256` is refused**, not installed
   unverified, so the checksum asset is not optional on the publishing side.
 
-**Build provenance comes from a generated header, written by a build step.**
-`tools/gen_build_info.cmake` runs on every build and writes
-`build/generated/fw_build_info.h` with `FW_BUILD_REPO` and `FW_BUILD_DIRTY`. Two
-things about that are load-bearing, and both were found by getting them wrong:
+**Development and release are separate builds, and the split is what removed the
+runtime guard.** A *release* build can update itself; a *development* build has no
+update path at all - `fw_update_task` is not even linked in, because nothing
+references it, so the code is absent rather than disabled by a flag. The panel
+hides the section and says why.
 
-- **Not at CMake configure time.** The dirty flag changes when a source file is
-  edited, and that makes CMake re-configure *not at all*, so a configure-time
-  value goes stale on the ordinary edit-then-rebuild path - precisely the case
-  the guard exists for.
-- **A header, not `add_compile_definitions()`.** Definitions set at the top level
-  do not reach an ESP-IDF component, and the failure is silent: the macro stays
-  undefined, the guard never fires, and the feature looks present. Threading them
-  through the cache to `main/CMakeLists.txt` works but is easy to get wrong;
-  a generated header with `target_include_directories` does not have the failure
-  mode. Verify by finding the origin string in `build/embedwrt.bin`, not by
-  reading the build log.
+The earlier design shipped one binary and decided at run time whether its feed
+could be trusted. That needed heuristics - which repository the build came from,
+whether the tree was clean - and both were got wrong at least once, silently.
+Here the answer is a property of how the artifact was produced:
 
-The generated file is rewritten only when its content changes, so an unchanged
-answer does not force a rebuild.
+```sh
+idf.py build                            # development
+idf.py -DEMBEDWRT_RELEASE=ON build      # release
+```
 
-**Both sides are reduced to `owner/repo` before comparison**, because a feed is
-an API path (`.../repos/owner/repo/releases/latest`, GitHub or Gitea) and a build
-origin is a clone URL (`https://host/owner/repo.git` or `git@host:owner/repo`).
-Comparing those directly never matches, and the guard then looks broken rather
-than strict. `repo_identity()` handles both, and takes the **last** two path
-segments when there is no `repos` marker - taking the first two yields
-`host/owner` and matches nothing. That mistake was in the first version and was
-caught by compiling the function on the host and running the real URLs through
-it, which is worth doing again if it is ever touched.
+`FW_DEFAULT_REPO` comes from `EMBEDWRT_REPO`, which CI sets from
+`$GITHUB_REPOSITORY`. So a fork's release build points at the fork with nothing
+to configure, and a device is never offered a firmware built from someone else's
+repository - the property the runtime check used to provide, obtained by
+construction instead.
+
+A development build also carries `-dev` in its version. That is honest in the
+panel, and it closes a footgun: `make_release.py` refuses to publish when the
+image's embedded version disagrees with `PROJECT_VER`, so a local build cannot be
+published as a release by accident. Without the suffix the check would pass and
+the release would ship with updates compiled out - invisible until a device
+refused to update itself.
+
+Two things to know if you touch the definitions: `add_compile_definitions()` at
+the top level does **not** reach an ESP-IDF component, and the failure is silent
+(the macro stays undefined, the release build behaves like a development one);
+they have to be attached in `main/CMakeLists.txt` with
+`target_compile_definitions`. And a cache variable has to be read before
+`project()`, because `PROJECT_VER` is consumed there. Verify by comparing the two
+images - `strings build/embedwrt.bin | grep 'auto-update from'` is present in a
+release build and absent in a development one - not by reading the build log.
 
 **The release CDN is unreachable from the device on this network, and that is
 not a firmware problem.** `release-assets.githubusercontent.com` — where every
@@ -656,16 +672,17 @@ invalidates the old one immediately, disabling developer mode invalidates a
 valid one, and settings plus token survive a reboot. The panel section renders
 correctly in both languages.
 
-**Verified on hardware, build provenance:** a build from a modified tree reports
-`modified: true` and refuses to enable auto-install (400 with the reason, not a
-silent 200); a feed for a different repository is refused with
-`feed is 'someone/embedwrt', this firmware is not`; a feed for the build's own
-repository is accepted and proceeds to the check. A clean build reports
-`modified: false`, auto-install can be enabled, and the stored setting is
-restored rather than lost — the modified build had forced it off at runtime
-without overwriting NVS. The staleness fix was verified directly: with a clean
-tree the generator reports `dirty=0`, and editing one source file and rebuilding
-without reconfiguring reports `dirty=1`.
+**Verified by building both channels:** the dev build does not contain
+`fw_update_task` at all (the linker drops it, nothing references it) and carries
+`automatic updates are disabled`; the release build carries `auto-update from`
+and lacks the dev message. A dev build reports version `1.5.0-dev` and
+`make_release.py` refuses to publish it. The two images differ by about 10 KB.
+
+**Not yet verified on hardware:** the dev/release channel behaviour at run time -
+that a dev build's panel hides the update section and that its endpoints refuse,
+and that a release build updates from a configured feed. The code paths and the
+artifacts are confirmed; the running device has not been exercised since the
+change, because the board was unplugged.
 
 **Verified on hardware, unattended install — blocked by the network, not the
 firmware:** the device reaches `api.github.com` and reports `up to date` against
