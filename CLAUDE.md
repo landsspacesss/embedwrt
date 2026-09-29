@@ -383,7 +383,7 @@ in a boot loop is a wired flash.
 
 ## The web page is generated — do not hand-edit it
 
-`html_page` in `main/my_wifi_router.c` is ~1200 lines of escaped C string
+`html_page` in `main/my_wifi_router.c` is ~1500 lines of escaped C string
 literals (~75 KB of HTML). It is produced from `tools/gen_page.py`, which holds
 the document naturally and emits the literals:
 
@@ -427,9 +427,11 @@ the edits one at a time, checking a list of expected function names after each
 step** — not patching the damaged copy. Two habits: pick the splice end as *the
 next top-level `function` definition*, never a comment that could appear anywhere;
 and sanity-check the output size — the generator prints the translated byte count
-(`spliced: N bytes of HTML`) and `main/page_as_served.js` was ~62 KB when this was
-written. A drop of tens of KB means something was deleted. Run the generator
-before and after a change to compare, rather than trusting a remembered number.
+(`spliced: N bytes of HTML`) and `main/page_as_served.js` was ~73 KB when this was
+written. A drop of tens of KB means something was deleted. The point is the
+comparison, not the figures here: run the generator before and after a change and
+diff the two, because a number written down in this file goes stale the next time
+the page grows - both of these did.
 
 ## Where the pieces live
 
