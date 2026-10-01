@@ -18,10 +18,23 @@ PSRAM) on `/dev/ttyACM0`.
 
 ```sh
 . /home/landspace/esp/esp-idf/export.sh   # ESP-IDF v6.1.0
-idf.py build
+idf.py build                              # a DEVELOPMENT build
 idf.py -p /dev/ttyACM0 flash
 idf.py -p /dev/ttyACM0 monitor            # WARNING: this resets the chip
 ```
+
+**A plain `idf.py build` produces a development build, and that is a real
+choice, not a detail.** Development builds never update themselves — no scheduled
+checks, no auto-install — and their version reads `1.5.0-dev`. To get one that
+does update, which is also what CI publishes:
+
+```sh
+idf.py -DEMBEDWRT_RELEASE=ON build
+```
+
+Everything manual works in both, so for ordinary work the default is what you
+want. It matters when you are about to test or ship the update path — see
+"Development and release are separate builds" under Automatic updates.
 
 **There is no test suite.** `idf.py test` does not apply here. Verification means
 building, flashing, and then exercising the running device over HTTP — the panel
@@ -87,19 +100,20 @@ idf.py -DEMBEDWRT_RELEASE=ON build          # a release build: updates exist
 python3 tools/local_feed.py --version 1.5.1 # prints the URL to use
 ```
 
-Then set the panel's release feed to the printed URL. The whole path - metadata,
-checksum, download, verify, flash, reboot - completes in about twenty seconds,
+Then set the panel's release feed to the printed URL. The whole path — metadata,
+checksum, download, verify, flash, reboot — completes in about twenty seconds,
 and the checksum fetch is exercised too, which is the step that cannot be
 reached against GitHub from here.
 
-**The build has to be a release build, or there is nothing to test.** A
-development build has no update path, so pointing one at a local feed produces a
-panel section that is hidden and endpoints that refuse. That is the design
-working, but it is also the first thing that will look like a bug.
+**The build has to be a release build** for the automatic half to exist. Point a
+development build at a local feed and checking and installing by hand still work
+— that is deliberate, so the update path can be developed — while the frequency
+selector and auto-install are disabled with a note saying why. Nothing looks
+broken; two controls are simply off.
 
 The feed URL happens to carry the repository path
 (`.../<owner>/<repo>/releases/latest`) because it mirrors the real feed shape.
-Nothing enforces that any more - the runtime repository check is gone - but a URL
+Nothing enforces that any more — the runtime repository check is gone — but a URL
 that looks like the one you ship with is one less difference to explain.
 
 Two more things that cost time here:
@@ -195,7 +209,7 @@ Design points that are deliberate:
 
 **Development and release are separate builds, and the split is what removed the
 runtime guard.** A *release* build updates itself; a *development* build never
-does anything on its own - no scheduled checks, no auto-install. Everything
+does anything on its own — no scheduled checks, no auto-install. Everything
 manual still works in both: the panel section, checking, and installing. That is
 deliberate, because developing the update path means pointing the device at a
 test feed and pushing a build.
@@ -208,8 +222,8 @@ last one replaces someone's firmware without being asked, so it should not
 depend on one earlier assignment staying correct.
 
 The earlier design shipped one binary and decided at run time whether its feed
-could be trusted. That needed heuristics - which repository the build came from,
-whether the tree was clean - and both were got wrong at least once, silently.
+could be trusted. That needed heuristics — which repository the build came from,
+whether the tree was clean — and both were got wrong at least once, silently.
 Here the answer is a property of how the artifact was produced:
 
 ```sh
@@ -218,22 +232,22 @@ idf.py -DEMBEDWRT_RELEASE=ON build      # release
 ```
 
 The panel keeps the update section in a development build and disables the two
-controls that describe automatic behaviour - the frequency selector and
-auto-install - with a note saying why. Hiding the section was the first attempt
+controls that describe automatic behaviour — the frequency selector and
+auto-install — with a note saying why. Hiding the section was the first attempt
 and was wrong: it made the update path untestable from a development build,
 which is exactly when you need to test it.
 
 `FW_DEFAULT_REPO` comes from `EMBEDWRT_REPO`, which CI sets from
 `$GITHUB_REPOSITORY`. So a fork's release build points at the fork with nothing
 to configure, and a device is never offered a firmware built from someone else's
-repository - the property the runtime check used to provide, obtained by
+repository — the property the runtime check used to provide, obtained by
 construction instead.
 
 A development build also carries `-dev` in its version. That is honest in the
 panel, and it closes a footgun: `make_release.py` refuses to publish when the
 image's embedded version disagrees with `PROJECT_VER`, so a local build cannot be
 published as a release by accident. Without the suffix the check would pass and
-the release would ship with updates compiled out - invisible until a device
+the release would ship with updates compiled out — invisible until a device
 refused to update itself.
 
 Two things to know if you touch the definitions: `add_compile_definitions()` at
@@ -431,7 +445,7 @@ and sanity-check the output size — the generator prints the translated byte co
 written. A drop of tens of KB means something was deleted. The point is the
 comparison, not the figures here: run the generator before and after a change and
 diff the two, because a number written down in this file goes stale the next time
-the page grows - both of these did.
+the page grows — both of these did.
 
 ## Where the pieces live
 
@@ -483,7 +497,7 @@ through `clients.c`, because an HTTP request carries nothing else. That single
 fact drives the whole design:
 
 - `caller_may_touch()` is the one authorization primitive in the request path:
-  admins touch anything, a guest only what `devices.c` says it may - its own
+  admins touch anything, a guest only what `devices.c` says it may — its own
   device, plus IoT devices it owns.
 - **Listing is deliberately wider than editing.** `/api/clients` and `/api/devices`
   use `devices_listed_for_guest()`, which also includes *unowned* IoT devices so a
@@ -491,7 +505,7 @@ fact drives the whole design:
   Rendering an edit form for a claimable-only device would just produce 403s.
 - A caller from the upstream LAN has no MAC in the client table, so it owns
   nothing and sees nothing until it logs in. That is the correct outcome, not a
-  gap - it has no device on this AP.
+  gap — it has no device on this AP.
 
 Two ownership policies live in `devices.c`, both on by default and both
 admin-only to change: **guest_claim** lets a visitor take an *unowned* IoT device
@@ -630,6 +644,17 @@ as `http://`.
   software big-integer arithmetic and that is irreducible. Session resumption is
   the effective lever, which is why `save_client_session` is set and why the
   relay reuses connections rather than reconnecting per query.
+- **DoH encrypts the query, not the connection.** The TLS handshake that follows
+  any HTTPS request carries the hostname in cleartext (SNI, unless ECH is in use),
+  so a network operator still sees which sites a client visits. What the relay
+  hides is the DNS lookup. This bounds what can honestly be claimed for the
+  feature: it defeats DNS-based blocking and stops the upstream link reading
+  lookups, and it does not make traffic unobservable. Proposals that assume the
+  latter cannot work, whatever is done to the resolver.
+- **This is a NAT, not a tunnel.** Client traffic is forwarded, not encapsulated,
+  so the upstream router sees the real destinations — it sees one IP address
+  instead of several, which hides *who* rather than *what*. Anything that needs to
+  hide the destination needs encapsulation, which is a different design.
 - **This network filters by destination.** Foreign DoH and DoT endpoints time out
   (TCP 443/853), while domestic ones work; foreign **plain DNS does work**. The
   preset lists in the panel reflect measurements, not assumptions — re-measure
@@ -693,7 +718,7 @@ carries the development-build message while a release build does not, and
 `make_release.py` refuses to publish the dev one. Both link the update task,
 since manual checking and installing work in either.
 
-**Not yet verified on hardware:** the dev/release behaviour at run time - that a
+**Not yet verified on hardware:** the dev/release behaviour at run time — that a
 dev build never checks on its own but still checks and installs by hand, that its
 panel disables only the two automatic controls, and that a release build updates
 from a configured feed. The artifacts are confirmed; the running device has not
