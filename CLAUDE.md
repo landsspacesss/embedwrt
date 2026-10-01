@@ -655,10 +655,17 @@ as `http://`.
   so the upstream router sees the real destinations — it sees one IP address
   instead of several, which hides *who* rather than *what*. Anything that needs to
   hide the destination needs encapsulation, which is a different design.
-- **This network filters by destination.** Foreign DoH and DoT endpoints time out
-  (TCP 443/853), while domestic ones work; foreign **plain DNS does work**. The
-  preset lists in the panel reflect measurements, not assumptions — re-measure
-  before adding a resolver to them.
+- **This network filters encrypted-DNS endpoints by IP, and the rule is not
+  clean.** Measured, not assumed: DoH to `1.1.1.1:443` and `8.8.8.8:443` returns
+  nothing, while DoT to `1.1.1.1:853` completes a handshake and DoT to
+  `8.8.8.8:853` does not. Foreign **plain DNS on :53 works**, and so does general
+  foreign HTTPS — a Cloudflare CDN address answers on 443 normally. So this is not
+  "foreign traffic is blocked": it targets known resolver endpoints specifically.
+  It is also **intermittent**, which this project has run into repeatedly
+  (`github.com` reachable, then not, then reachable). One measurement is not
+  proof of a rule. The preset lists in the panel reflect measurements, and this is
+  why `doh_relay_probe()` / `/api/dnstest` exist — re-measure before adding a
+  resolver rather than reasoning about it.
 - **iOS keeps one random MAC per remembered network.** Reconnecting to the same
   SSID preserves it; **changing the SSID or using "Forget This Network" produces a
   new one**, which silently invalidates static leases and per-device DNS rules.
