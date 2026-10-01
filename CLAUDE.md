@@ -645,16 +645,38 @@ as `http://`.
   the effective lever, which is why `save_client_session` is set and why the
   relay reuses connections rather than reconnecting per query.
 - **DoH encrypts the query, not the connection.** The TLS handshake that follows
-  any HTTPS request carries the hostname in cleartext (SNI, unless ECH is in use),
-  so a network operator still sees which sites a client visits. What the relay
-  hides is the DNS lookup. This bounds what can honestly be claimed for the
-  feature: it defeats DNS-based blocking and stops the upstream link reading
-  lookups, and it does not make traffic unobservable. Proposals that assume the
-  latter cannot work, whatever is done to the resolver.
+  any HTTPS request carries the hostname in cleartext (SNI), so a network operator
+  still sees which sites a client visits. What the relay hides is the DNS lookup.
+  This bounds what can honestly be claimed for the feature: it defeats DNS-based
+  blocking and stops the upstream link reading lookups, and it does not make
+  traffic unobservable.
+- **The two things people propose for the SNI problem cannot be built here.**
+  *ECH* is the real fix, but it is barely deployed: measured twice, bilibili,
+  taobao, zhihu, douyin and xiaohongshu publish an HTTPS RR with no `ech=`, and so
+  do Cloudflare's own main domains — only `crypto.cloudflare.com` carries one.
+  (ECH itself negotiated fine from a browser on this network, reporting
+  `sni=encrypted`, so the limit is deployment rather than the network.) *SNI
+  forging* — Sheas-Cealer and similar — is a **client-side** trick: it sets
+  Chromium launch flags to send a decoy name and resolve it to the real IP, then
+  suppresses the certificate error that follows, which is why it needs
+  `--ignore-certificate-errors`. All of it lives in the browser. A router could
+  only do it by terminating the client's TLS, which means installing a CA on every
+  device and turning the router into a full decryption point — a different and
+  much worse design, and not what those tools do.
 - **This is a NAT, not a tunnel.** Client traffic is forwarded, not encapsulated,
   so the upstream router sees the real destinations — it sees one IP address
   instead of several, which hides *who* rather than *what*. Anything that needs to
   hide the destination needs encapsulation, which is a different design.
+- **There is no way to load an application at runtime, and no sandbox if there
+  were.** ESP-IDF builds one image that the bootloader maps at boot; there is no
+  ELF-loader component and no `dlopen`. The S3 does have memory protection
+  (`CONFIG_ESP_SYSTEM_MEMPROT`, which is on) but it is W^X — it splits RAM into
+  instruction and data and sets permissions, a mitigation against code injection
+  rather than isolation between tasks. Every task shares one address space, so
+  anything added runs with full access to the panel password, the NVS blobs and
+  the forwarding path. "Install apps" is therefore not a smaller version of a
+  package manager: it needs a different design, and the constraint is RAM (~72 KB
+  internal free), not the 7.9 MB of unused flash.
 - **This network filters encrypted-DNS endpoints by IP, and the rule is not
   clean.** Measured, not assumed: DoH to `1.1.1.1:443` and `8.8.8.8:443` returns
   nothing, while DoT to `1.1.1.1:853` completes a handshake and DoT to
